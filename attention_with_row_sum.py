@@ -83,7 +83,8 @@ def _fwd_kernel_with_row_sum(
     l_i = tl.zeros([BLOCK_M], dtype=tl.float32)
     acc = tl.zeros([BLOCK_M, BLOCK_DMODEL], dtype=tl.float32)
 
-    # Initialize row sum accumulator
+    # Initialize row sum accumulator (for sum(exp(scores)))
+    # Use numerical stability: accumulate exp(s - m_i) and multiply by exp(m_i) at the end
     row_sum_acc = tl.zeros([BLOCK_M], dtype=tl.float32)
 
     # load q
@@ -113,8 +114,6 @@ def _fwd_kernel_with_row_sum(
     k_ptrs = K + (offs_k[:, None] * stride_vk + offs_n_init[None, :] * stride_vn)
     v_ptrs = V + (offs_n_init[:, None] * stride_kn + offs_k[None, :] * stride_kk)
 
-    row_sum_acc = tl.zeros([BLOCK_M], dtype=tl.float32)
-
     for start_n in range(0, hi, BLOCK_N):
         start_n = tl.multiple_of(start_n, BLOCK_N)
         offs_n = start_n + offs_n_base
@@ -132,22 +131,27 @@ def _fwd_kernel_with_row_sum(
         s = tl.dot(q, k)
         
         # -- Apply mask and scaling --
-        # 1. First save original score for row sum
-        s_for_sum = s * sm_scale  # Scaled original score
-        
-        # 2. Apply boundary mask
+        # 1. Apply boundary mask
         if not DIVISIBLE_N:
             mask_n = offs_n < N
             s = tl.where(mask_n[None, :], s, float("-inf"))
-            s_for_sum = tl.where(mask_n[None, :], s_for_sum, 0.0)
         
-        # 3. Apply causal mask (shared computation)
+        # 2. Apply causal mask
         if IS_CAUSAL:
             causal_mask = (P_SEQ + offs_m[:, None]) >= offs_n[None, :]
             s = tl.where(causal_mask, s, float("-inf"))
+
+        # -- Accumulate row sum (sum(scores)) --
+        # Compute scaled scores for row sum
+        s_for_sum = s * sm_scale
+        # Apply masks (set masked positions to 0 for sum)
+        if not DIVISIBLE_N:
+            mask_n = offs_n < N
+            s_for_sum = tl.where(mask_n[None, :], s_for_sum, 0.0)
+        if IS_CAUSAL:
+            causal_mask = (P_SEQ + offs_m[:, None]) >= offs_n[None, :]
             s_for_sum = tl.where(causal_mask, s_for_sum, 0.0)
-        
-        # -- Accumulate row sum (before softmax) --
+        # Sum over keys dimension (dim=1)
         row_sum_block = tl.sum(s_for_sum, 1)
         row_sum_acc += row_sum_block
 
@@ -178,6 +182,7 @@ def _fwd_kernel_with_row_sum(
         is_empty_line = (offs_m + P_SEQ) < 0
         acc = tl.where(is_empty_line[:, None], 0.0, acc * (1.0 / l_i[:, None]))
         l = tl.where(is_empty_line, float("-inf"), m_i * sm_scale + tl.log(l_i))
+        row_sum_acc = tl.where(is_empty_line, 0.0, row_sum_acc)
     else:
         acc = acc * (1.0 / l_i[:, None])
         l = m_i * sm_scale + tl.log(l_i)

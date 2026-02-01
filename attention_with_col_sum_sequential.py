@@ -133,24 +133,34 @@ def _fwd_kernel_with_col_sum_sequential(
         s = tl.dot(q, k)
         
         # -- Apply mask and scaling --
-        # 1. First save original score for col sum
-        s_for_sum = s * sm_scale  # Scaled original score
-        
-        # 2. Apply boundary mask
+        # 1. Apply boundary mask
         if not DIVISIBLE_N:
             mask_n = offs_n < N
             s = tl.where(mask_n[None, :], s, float("-inf"))
-            s_for_sum = tl.where(mask_n[None, :], s_for_sum, 0.0)
         
-        # 3. Apply causal mask (shared computation)
+        # 2. Apply causal mask
         if IS_CAUSAL:
             causal_mask = (P_SEQ + offs_m[:, None]) >= offs_n[None, :]
             s = tl.where(causal_mask, s, float("-inf"))
+
+        # -- Accumulate col sum (sum(scores)) --
+        # Compute scaled scores for col sum
+        s_for_sum = s * sm_scale
+        # Apply masks (set masked positions to 0 for sum)
+        if not DIVISIBLE_N:
+            mask_n = offs_n < N
+            s_for_sum = tl.where(mask_n[None, :], s_for_sum, 0.0)
+        if IS_CAUSAL:
+            causal_mask = (P_SEQ + offs_m[:, None]) >= offs_n[None, :]
             s_for_sum = tl.where(causal_mask, s_for_sum, 0.0)
-        
-        # -- Accumulate col sum (before softmax) --
         # Sum over queries dimension (dim=0), get (BLOCK_N,) - local sum for each key position
         col_sum_block = tl.sum(s_for_sum, 0)  # (BLOCK_N,)
+
+        # -- Numerically stable softmax --
+        m_i_new = tl.maximum(m_i, tl.max(s, 1))
+        alpha = tl.math.exp2((m_i - m_i_new) * qk_scale)
+        p = tl.math.exp2(s * qk_scale - m_i_new[:, None] * qk_scale)
+        p_sum = tl.sum(p, 1)
         
         # Use atomic operations to accumulate to global col_sum
         # Note: Multiple query blocks write to the same column positions, must use atomic operations
@@ -160,12 +170,6 @@ def _fwd_kernel_with_col_sum_sequential(
         else:
             mask_n = offs_n < N
             tl.atomic_add(col_sum_ptrs, col_sum_block, mask=mask_n, sem="relaxed")
-
-        # -- Numerically stable softmax --
-        m_i_new = tl.maximum(m_i, tl.max(s, 1))
-        alpha = tl.math.exp2((m_i - m_i_new) * qk_scale)
-        p = tl.math.exp2(s * qk_scale - m_i_new[:, None] * qk_scale)
-        p_sum = tl.sum(p, 1)
 
         # -- dropout --
         if IS_DROPOUT:
@@ -329,4 +333,3 @@ def attention_with_col_sum_sequential(
                     raise
 
     return o, col_sum
-
