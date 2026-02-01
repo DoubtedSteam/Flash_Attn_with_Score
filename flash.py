@@ -2,10 +2,20 @@ import math
 import torch
 import triton
 import triton.language as tl
-from .total import _total_attention_kernel
-from .split_kv import _fwd_split_kv_kernel, _fwd_combine_kv_splits, num_splits_herustic
-from .split_kv import get_fwd_config as get_fwd_config_kv_split
-from .dropout import philox_cuda_seed_offset
+try:
+    from .total import _total_attention_kernel
+    from .split_kv import _fwd_split_kv_kernel, _fwd_combine_kv_splits, num_splits_herustic
+    from .split_kv import get_fwd_config as get_fwd_config_kv_split
+    from .dropout import philox_cuda_seed_offset
+except ImportError:
+    # Handle case when running as standalone
+    import sys
+    import os
+    sys.path.insert(0, os.path.dirname(__file__))
+    from total import _total_attention_kernel
+    from split_kv import _fwd_split_kv_kernel, _fwd_combine_kv_splits, num_splits_herustic
+    from split_kv import get_fwd_config as get_fwd_config_kv_split
+    from dropout import philox_cuda_seed_offset
 
 __all__ = ["attention"]
 
