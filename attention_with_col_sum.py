@@ -202,73 +202,79 @@ def _fwd_kernel_with_col_sum(
                 l_i = l_i * alpha + p_sum
                 m_i = m_i_new
     else:
-        # Non-causal case, maintain forward-order processing
-        offs_n_init = offs_n_base
-        k_ptrs = K + (offs_k[:, None] * stride_vk + offs_n_init[None, :] * stride_vn)
-        v_ptrs = V + (offs_n_init[:, None] * stride_kn + offs_k[None, :] * stride_kk)
-
-        for start_n in range(0, hi, BLOCK_N):
-            start_n = tl.multiple_of(start_n, BLOCK_N)
-            offs_n = start_n + offs_n_base
-
-            # -- Load k, v --
-            if DIVISIBLE_N:
-                k = tl.load(k_ptrs, cache_modifier=".cg")
-                v = tl.load(v_ptrs, cache_modifier=".cg")
-            else:
-                mask_n = offs_n < N
-                k = tl.load(k_ptrs, mask=mask_n[None, :], cache_modifier=".cg")
-                v = tl.load(v_ptrs, mask=mask_n[:, None], cache_modifier=".cg")
-
-            # -- Compute QK^T once (only once per key block) --
-            s = tl.dot(q, k)
+        # Non-causal case: use Round-Robin processing to reduce atomic contention
+        # Round-Robin allows different query blocks to process different key columns simultaneously
+        max_blocks = (hi + BLOCK_N - 1) // BLOCK_N
+        
+        for block_offset in range(max_blocks):
+            # Calculate Round-Robin key block index
+            # Each query block starts from a different key block to reduce contention
+            block_idx = (start_m % max_blocks + block_offset) % max_blocks
+            start_n = block_idx * BLOCK_N
             
-            # -- Apply mask and scaling --
-            # 1. Apply boundary mask
-            if not DIVISIBLE_N:
-                mask_n = offs_n < N
-                s = tl.where(mask_n[None, :], s, float("-inf"))
+            # Check if block is valid
+            if start_n < hi:
+                start_n = tl.multiple_of(start_n, BLOCK_N)
+                offs_n = start_n + offs_n_base
+                
+                # Recompute pointer positions (non-sequential access)
+                k_ptrs = K + (offs_k[:, None] * stride_vk + offs_n[None, :] * stride_vn)
+                v_ptrs = V + (offs_n[:, None] * stride_kn + offs_k[None, :] * stride_kk)
 
-            # -- Accumulate col sum (sum(scores)) --
-            # Compute scaled scores for col sum
-            s_for_sum = s * sm_scale
-            # Apply masks (set masked positions to 0 for sum)
-            if not DIVISIBLE_N:
-                mask_n = offs_n < N
-                s_for_sum = tl.where(mask_n[None, :], s_for_sum, 0.0)
-            # Sum over queries dimension (dim=0), get (BLOCK_N,) - local sum for each key position
-            col_sum_block = tl.sum(s_for_sum, 0)  # (BLOCK_N,)
+                # -- Load k, v --
+                if DIVISIBLE_N:
+                    k = tl.load(k_ptrs, cache_modifier=".cg")
+                    v = tl.load(v_ptrs, cache_modifier=".cg")
+                else:
+                    mask_n = offs_n < N
+                    k = tl.load(k_ptrs, mask=mask_n[None, :], cache_modifier=".cg")
+                    v = tl.load(v_ptrs, mask=mask_n[:, None], cache_modifier=".cg")
 
-            # -- 数值稳定的 softmax --
-            m_i_new = tl.maximum(m_i, tl.max(s, 1))
-            alpha = tl.math.exp2((m_i - m_i_new) * qk_scale)
-            p = tl.math.exp2(s * qk_scale - m_i_new[:, None] * qk_scale)
-            p_sum = tl.sum(p, 1)
-            
-            # Use atomic operations to accumulate to global col_sum
-            # Note: Multiple query blocks write to the same column positions, must use atomic operations
-            col_sum_ptrs = ColSum + offs_n
-            if DIVISIBLE_N:
-                tl.atomic_add(col_sum_ptrs, col_sum_block, sem="relaxed")
-            else:
-                mask_n = offs_n < N
-                tl.atomic_add(col_sum_ptrs, col_sum_block, mask=mask_n, sem="relaxed")
+                # -- Compute QK^T once (only once per key block) --
+                s = tl.dot(q, k)
+                
+                # -- Apply mask and scaling --
+                # 1. Apply boundary mask
+                if not DIVISIBLE_N:
+                    mask_n = offs_n < N
+                    s = tl.where(mask_n[None, :], s, float("-inf"))
 
-            # -- dropout --
-            if IS_DROPOUT:
-                offs_rng = start_n + offs_rng_base
-                pmask = tl.rand(seed, offs_rng, n_rounds=6) > dropout_p
-                p *= pmask.to(tl.float32)
+                # -- Accumulate col sum (sum(scores)) --
+                # Compute scaled scores for col sum
+                s_for_sum = s * sm_scale
+                # Apply masks (set masked positions to 0 for sum)
+                if not DIVISIBLE_N:
+                    mask_n = offs_n < N
+                    s_for_sum = tl.where(mask_n[None, :], s_for_sum, 0.0)
+                # Sum over queries dimension (dim=0), get (BLOCK_N,) - local sum for each key position
+                col_sum_block = tl.sum(s_for_sum, 0)  # (BLOCK_N,)
 
-            # -- 更新累加器 --
-            acc *= alpha[:, None]
-            acc += tl.dot(p.to(input_dtype), v)
-            l_i = l_i * alpha + p_sum
-            m_i = m_i_new
-            
-            # Update pointers
-            k_ptrs += BLOCK_N * stride_kn
-            v_ptrs += BLOCK_N * stride_vn
+                # -- 数值稳定的 softmax --
+                m_i_new = tl.maximum(m_i, tl.max(s, 1))
+                alpha = tl.math.exp2((m_i - m_i_new) * qk_scale)
+                p = tl.math.exp2(s * qk_scale - m_i_new[:, None] * qk_scale)
+                p_sum = tl.sum(p, 1)
+                
+                # Use atomic operations to accumulate to global col_sum
+                # Round-Robin reduces contention by distributing writes across different key positions
+                col_sum_ptrs = ColSum + offs_n
+                if DIVISIBLE_N:
+                    tl.atomic_add(col_sum_ptrs, col_sum_block, sem="relaxed")
+                else:
+                    mask_n = offs_n < N
+                    tl.atomic_add(col_sum_ptrs, col_sum_block, mask=mask_n, sem="relaxed")
+
+                # -- dropout --
+                if IS_DROPOUT:
+                    offs_rng = start_n + offs_rng_base
+                    pmask = tl.rand(seed, offs_rng, n_rounds=6) > dropout_p
+                    p *= pmask.to(tl.float32)
+
+                # -- 更新累加器 --
+                acc *= alpha[:, None]
+                acc += tl.dot(p.to(input_dtype), v)
+                l_i = l_i * alpha + p_sum
+                m_i = m_i_new
 
     # write back l & o
     if IS_CAUSAL and LARGER_M:
