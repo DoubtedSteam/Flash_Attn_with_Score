@@ -27,6 +27,7 @@ from attention_with_scores import attention_with_scores
 from attention_with_row_sum import attention_with_row_sum
 from attention_with_col_sum import attention_with_col_sum
 from attention_with_col_sum_sequential import attention_with_col_sum_sequential
+from attention_with_col_softmax_sum import attention_with_softmax_col_sum
 from attention_cross_token_softmax_sum import attention_cross_token_softmax_sum, attention_cross_token_softmax_sum_buffered
 from attention_cross_token_qk_sum import attention_cross_token_qk_sum
 from reference_implementations import naive_attention_with_scores, pytorch_sdpa_attention_with_scores
@@ -98,6 +99,22 @@ def override_get_fwd_config(config: Tuple[int, int, int, int]):
     finally:
         # Restore original function
         flash_module.get_fwd_config = original_get_fwd_config
+
+
+def pad_sequence_to_multiple(seq_len: int, block_size: int) -> int:
+    """
+    Pad sequence length to be divisible by block_size
+
+    Args:
+        seq_len: Original sequence length
+        block_size: Block size (typically 64 or 128)
+
+    Returns:
+        Padded sequence length that is divisible by block_size
+    """
+    if seq_len % block_size == 0:
+        return seq_len
+    return ((seq_len + block_size - 1) // block_size) * block_size
 
 
 def search_best_config(
@@ -249,12 +266,21 @@ def benchmark_attention_with_scores(
     """
     if device != "cuda":
         raise ValueError("do_bench only supports CUDA devices")
-    
+
+    # Pad sequence lengths to be divisible by typical block size (64)
+    BLOCK_SIZE = 64
+    seq_len_q_padded = pad_sequence_to_multiple(seq_len_q, BLOCK_SIZE)
+    seq_len_k_padded = pad_sequence_to_multiple(seq_len_k, BLOCK_SIZE)
+
+    # Print padding info if sequences were padded
+    if seq_len_q_padded != seq_len_q or seq_len_k_padded != seq_len_k:
+        print(f"  Padding: seq_q {seq_len_q} -> {seq_len_q_padded}, seq_k {seq_len_k} -> {seq_len_k_padded}")
+
     try:
-        # Create input tensors
-        q = torch.randn(batch_size, num_heads_q, seq_len_q, head_dim, dtype=dtype, device=device)
-        k = torch.randn(batch_size, num_heads_k, seq_len_k, head_dim, dtype=dtype, device=device)
-        v = torch.randn(batch_size, num_heads_k, seq_len_k, head_dim, dtype=dtype, device=device)
+        # Create input tensors with padded dimensions
+        q = torch.randn(batch_size, num_heads_q, seq_len_q_padded, head_dim, dtype=dtype, device=device)
+        k = torch.randn(batch_size, num_heads_k, seq_len_k_padded, head_dim, dtype=dtype, device=device)
+        v = torch.randn(batch_size, num_heads_k, seq_len_k_padded, head_dim, dtype=dtype, device=device)
         
         q = q.contiguous()
         k = k.contiguous()
@@ -407,11 +433,20 @@ def benchmark_row_sum(
     """
     if device != "cuda":
         raise ValueError("do_bench only supports CUDA devices")
-    
+
+    # Pad sequence lengths to be divisible by typical block size (64)
+    BLOCK_SIZE = 64
+    seq_len_q_padded = pad_sequence_to_multiple(seq_len_q, BLOCK_SIZE)
+    seq_len_k_padded = pad_sequence_to_multiple(seq_len_k, BLOCK_SIZE)
+
+    # Print padding info if sequences were padded
+    if seq_len_q_padded != seq_len_q or seq_len_k_padded != seq_len_k:
+        print(f"  Padding: seq_q {seq_len_q} -> {seq_len_q_padded}, seq_k {seq_len_k} -> {seq_len_k_padded}")
+
     try:
-        q = torch.randn(batch_size, num_heads_q, seq_len_q, head_dim, dtype=dtype, device=device)
-        k = torch.randn(batch_size, num_heads_k, seq_len_k, head_dim, dtype=dtype, device=device)
-        v = torch.randn(batch_size, num_heads_k, seq_len_k, head_dim, dtype=dtype, device=device)
+        q = torch.randn(batch_size, num_heads_q, seq_len_q_padded, head_dim, dtype=dtype, device=device)
+        k = torch.randn(batch_size, num_heads_k, seq_len_k_padded, head_dim, dtype=dtype, device=device)
+        v = torch.randn(batch_size, num_heads_k, seq_len_k_padded, head_dim, dtype=dtype, device=device)
         
         q = q.contiguous()
         k = k.contiguous()
@@ -511,11 +546,20 @@ def benchmark_col_sum(
     """
     if device != "cuda":
         raise ValueError("do_bench only supports CUDA devices")
-    
+
+    # Pad sequence lengths to be divisible by typical block size (64)
+    BLOCK_SIZE = 64
+    seq_len_q_padded = pad_sequence_to_multiple(seq_len_q, BLOCK_SIZE)
+    seq_len_k_padded = pad_sequence_to_multiple(seq_len_k, BLOCK_SIZE)
+
+    # Print padding info if sequences were padded
+    if seq_len_q_padded != seq_len_q or seq_len_k_padded != seq_len_k:
+        print(f"  Padding: seq_q {seq_len_q} -> {seq_len_q_padded}, seq_k {seq_len_k} -> {seq_len_k_padded}")
+
     try:
-        q = torch.randn(batch_size, num_heads_q, seq_len_q, head_dim, dtype=dtype, device=device)
-        k = torch.randn(batch_size, num_heads_k, seq_len_k, head_dim, dtype=dtype, device=device)
-        v = torch.randn(batch_size, num_heads_k, seq_len_k, head_dim, dtype=dtype, device=device)
+        q = torch.randn(batch_size, num_heads_q, seq_len_q_padded, head_dim, dtype=dtype, device=device)
+        k = torch.randn(batch_size, num_heads_k, seq_len_k_padded, head_dim, dtype=dtype, device=device)
+        v = torch.randn(batch_size, num_heads_k, seq_len_k_padded, head_dim, dtype=dtype, device=device)
         
         q = q.contiguous()
         k = k.contiguous()
@@ -615,11 +659,20 @@ def benchmark_col_sum_sequential(
     """
     if device != "cuda":
         raise ValueError("do_bench only supports CUDA devices")
-    
+
+    # Pad sequence lengths to be divisible by typical block size (64)
+    BLOCK_SIZE = 64
+    seq_len_q_padded = pad_sequence_to_multiple(seq_len_q, BLOCK_SIZE)
+    seq_len_k_padded = pad_sequence_to_multiple(seq_len_k, BLOCK_SIZE)
+
+    # Print padding info if sequences were padded
+    if seq_len_q_padded != seq_len_q or seq_len_k_padded != seq_len_k:
+        print(f"  Padding: seq_q {seq_len_q} -> {seq_len_q_padded}, seq_k {seq_len_k} -> {seq_len_k_padded}")
+
     try:
-        q = torch.randn(batch_size, num_heads_q, seq_len_q, head_dim, dtype=dtype, device=device)
-        k = torch.randn(batch_size, num_heads_k, seq_len_k, head_dim, dtype=dtype, device=device)
-        v = torch.randn(batch_size, num_heads_k, seq_len_k, head_dim, dtype=dtype, device=device)
+        q = torch.randn(batch_size, num_heads_q, seq_len_q_padded, head_dim, dtype=dtype, device=device)
+        k = torch.randn(batch_size, num_heads_k, seq_len_k_padded, head_dim, dtype=dtype, device=device)
+        v = torch.randn(batch_size, num_heads_k, seq_len_k_padded, head_dim, dtype=dtype, device=device)
         
         q = q.contiguous()
         k = k.contiguous()
@@ -699,6 +752,119 @@ def benchmark_col_sum_sequential(
         }
 
 
+def benchmark_col_softmax_sum(
+    batch_size: int,
+    num_heads_q: int,
+    num_heads_k: int,
+    seq_len_q: int,
+    seq_len_k: int,
+    head_dim: int,
+    causal: bool = False,
+    dropout_p: float = 0.0,
+    dtype: torch.dtype = torch.float16,
+    warmup_ms: int = 50,
+    rep_ms: int = 200,
+    num_runs: int = 3,
+    device: str = "cuda",
+) -> Dict[str, float]:
+    """
+    Benchmark attention_with_softmax_col_sum implementation
+    """
+    if device != "cuda":
+        raise ValueError("do_bench only supports CUDA devices")
+
+    # Pad sequence lengths to be divisible by typical block size (64)
+    BLOCK_SIZE = 64
+    seq_len_q_padded = pad_sequence_to_multiple(seq_len_q, BLOCK_SIZE)
+    seq_len_k_padded = pad_sequence_to_multiple(seq_len_k, BLOCK_SIZE)
+
+    # Print padding info if sequences were padded
+    if seq_len_q_padded != seq_len_q or seq_len_k_padded != seq_len_k:
+        print(f"  Padding: seq_q {seq_len_q} -> {seq_len_q_padded}, seq_k {seq_len_k} -> {seq_len_k_padded}")
+
+    try:
+        q = torch.randn(batch_size, num_heads_q, seq_len_q_padded, head_dim, dtype=dtype, device=device)
+        k = torch.randn(batch_size, num_heads_k, seq_len_k_padded, head_dim, dtype=dtype, device=device)
+        v = torch.randn(batch_size, num_heads_k, seq_len_k_padded, head_dim, dtype=dtype, device=device)
+
+        q = q.contiguous()
+        k = k.contiguous()
+        v = v.contiguous()
+
+        def fn():
+            return attention_with_softmax_col_sum(q, k, v, causal=causal, dropout_p=dropout_p)
+
+        all_run_times = []
+        total_runs_to_perform = num_runs + 2
+
+        for run_idx in range(total_runs_to_perform):
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+
+            # JIT compilation warmup
+            for _ in range(5):
+                _ = fn()
+            torch.cuda.synchronize()
+
+            run_ms = do_bench(fn, warmup=warmup_ms, rep=rep_ms)
+            if run_ms != float("inf") and run_ms > 0:
+                all_run_times.append(run_ms)
+
+        if len(all_run_times) >= num_runs:
+            times_for_calculation = all_run_times[-num_runs:]
+        else:
+            times_for_calculation = all_run_times
+
+        if len(times_for_calculation) == 0:
+            ms = float("inf")
+            avg_ms = float("inf")
+            min_ms = float("inf")
+            max_ms = float("inf")
+        else:
+            avg_ms = sum(times_for_calculation) / len(times_for_calculation)
+            sorted_times = sorted(times_for_calculation)
+            min_ms = sorted_times[0]
+            max_ms = sorted_times[-1]
+            median_ms = sorted_times[len(sorted_times) // 2]
+            ms = median_ms
+
+        total_tokens = batch_size * num_heads_q * seq_len_q
+        throughput = total_tokens / (ms / 1000) if ms != float("inf") else 0.0
+
+        # FLOPS: same as attention_with_scores
+        flops = 4 * batch_size * num_heads_q * seq_len_q * seq_len_k * head_dim
+        tflops = (flops / (ms / 1000)) / 1e12 if ms != float("inf") else 0.0
+
+        return {
+            "avg_time_ms": avg_ms,
+            "median_time_ms": ms,
+            "min_time_ms": min_ms,
+            "max_time_ms": max_ms,
+            "throughput_tokens_per_sec": throughput,
+            "tflops": tflops,
+        }
+
+    except torch.cuda.OutOfMemoryError:
+        return {
+            "avg_time_ms": float("inf"),
+            "median_time_ms": float("inf"),
+            "min_time_ms": float("inf"),
+            "max_time_ms": float("inf"),
+            "throughput_tokens_per_sec": 0.0,
+            "tflops": 0.0,
+        }
+    except Exception as e:
+        print(f"Error: {e}")
+        return {
+            "avg_time_ms": float("inf"),
+            "median_time_ms": float("inf"),
+            "min_time_ms": float("inf"),
+            "max_time_ms": float("inf"),
+            "throughput_tokens_per_sec": 0.0,
+            "tflops": 0.0,
+        }
+
+
 def benchmark_cross_token_softmax(
     batch_size: int,
     num_heads_q: int,
@@ -721,10 +887,19 @@ def benchmark_cross_token_softmax(
     if device != "cuda":
         raise ValueError("do_bench only supports CUDA devices")
 
+    # Pad sequence lengths to be divisible by typical block size (64)
+    BLOCK_SIZE = 64
+    seq_len_q_padded = pad_sequence_to_multiple(seq_len_q, BLOCK_SIZE)
+    seq_len_k_padded = pad_sequence_to_multiple(seq_len_k, BLOCK_SIZE)
+
+    # Print padding info if sequences were padded
+    if seq_len_q_padded != seq_len_q or seq_len_k_padded != seq_len_k:
+        print(f"  Padding: seq_q {seq_len_q} -> {seq_len_q_padded}, seq_k {seq_len_k} -> {seq_len_k_padded}")
+
     try:
-        q = torch.randn(batch_size, num_heads_q, seq_len_q, head_dim, dtype=dtype, device=device)
-        k = torch.randn(batch_size, num_heads_k, seq_len_k, head_dim, dtype=dtype, device=device)
-        v = torch.randn(batch_size, num_heads_k, seq_len_k, head_dim, dtype=dtype, device=device)
+        q = torch.randn(batch_size, num_heads_q, seq_len_q_padded, head_dim, dtype=dtype, device=device)
+        k = torch.randn(batch_size, num_heads_k, seq_len_k_padded, head_dim, dtype=dtype, device=device)
+        v = torch.randn(batch_size, num_heads_k, seq_len_k_padded, head_dim, dtype=dtype, device=device)
 
         q = q.contiguous()
         k = k.contiguous()
@@ -821,10 +996,19 @@ def benchmark_cross_token_softmax_buffered(
     if device != "cuda":
         raise ValueError("do_bench only supports CUDA devices")
 
+    # Pad sequence lengths to be divisible by typical block size (64)
+    BLOCK_SIZE = 64
+    seq_len_q_padded = pad_sequence_to_multiple(seq_len_q, BLOCK_SIZE)
+    seq_len_k_padded = pad_sequence_to_multiple(seq_len_k, BLOCK_SIZE)
+
+    # Print padding info if sequences were padded
+    if seq_len_q_padded != seq_len_q or seq_len_k_padded != seq_len_k:
+        print(f"  Padding: seq_q {seq_len_q} -> {seq_len_q_padded}, seq_k {seq_len_k} -> {seq_len_k_padded}")
+
     try:
-        q = torch.randn(batch_size, num_heads_q, seq_len_q, head_dim, dtype=dtype, device=device)
-        k = torch.randn(batch_size, num_heads_k, seq_len_k, head_dim, dtype=dtype, device=device)
-        v = torch.randn(batch_size, num_heads_k, seq_len_k, head_dim, dtype=dtype, device=device)
+        q = torch.randn(batch_size, num_heads_q, seq_len_q_padded, head_dim, dtype=dtype, device=device)
+        k = torch.randn(batch_size, num_heads_k, seq_len_k_padded, head_dim, dtype=dtype, device=device)
+        v = torch.randn(batch_size, num_heads_k, seq_len_k_padded, head_dim, dtype=dtype, device=device)
 
         q = q.contiguous()
         k = k.contiguous()
@@ -918,11 +1102,20 @@ def benchmark_cross_token_qk(
     """
     if device != "cuda":
         raise ValueError("do_bench only supports CUDA devices")
-    
+
+    # Pad sequence lengths to be divisible by typical block size (64)
+    BLOCK_SIZE = 64
+    seq_len_q_padded = pad_sequence_to_multiple(seq_len_q, BLOCK_SIZE)
+    seq_len_k_padded = pad_sequence_to_multiple(seq_len_k, BLOCK_SIZE)
+
+    # Print padding info if sequences were padded
+    if seq_len_q_padded != seq_len_q or seq_len_k_padded != seq_len_k:
+        print(f"  Padding: seq_q {seq_len_q} -> {seq_len_q_padded}, seq_k {seq_len_k} -> {seq_len_k_padded}")
+
     try:
-        q = torch.randn(batch_size, num_heads_q, seq_len_q, head_dim, dtype=dtype, device=device)
-        k = torch.randn(batch_size, num_heads_k, seq_len_k, head_dim, dtype=dtype, device=device)
-        v = torch.randn(batch_size, num_heads_k, seq_len_k, head_dim, dtype=dtype, device=device)
+        q = torch.randn(batch_size, num_heads_q, seq_len_q_padded, head_dim, dtype=dtype, device=device)
+        k = torch.randn(batch_size, num_heads_k, seq_len_k_padded, head_dim, dtype=dtype, device=device)
+        v = torch.randn(batch_size, num_heads_k, seq_len_k_padded, head_dim, dtype=dtype, device=device)
         
         q = q.contiguous()
         k = k.contiguous()
@@ -1074,12 +1267,21 @@ def verify_correctness(
         }
     """
     print(f"  Verifying correctness...")
-    
+
+    # Pad sequence lengths to be divisible by typical block size (64)
+    BLOCK_SIZE = 64
+    seq_len_q_padded = pad_sequence_to_multiple(seq_len_q, BLOCK_SIZE)
+    seq_len_k_padded = pad_sequence_to_multiple(seq_len_k, BLOCK_SIZE)
+
+    # Print padding info if sequences were padded
+    if seq_len_q_padded != seq_len_q or seq_len_k_padded != seq_len_k:
+        print(f"  Padding for verification: seq_q {seq_len_q} -> {seq_len_q_padded}, seq_k {seq_len_k} -> {seq_len_k_padded}")
+
     # Create input tensors with fixed seed for reproducibility
     torch.manual_seed(42)
-    q = torch.randn(batch_size, num_heads_q, seq_len_q, head_dim, dtype=dtype, device=device)
-    k = torch.randn(batch_size, num_heads_k, seq_len_k, head_dim, dtype=dtype, device=device)
-    v = torch.randn(batch_size, num_heads_k, seq_len_k, head_dim, dtype=dtype, device=device)
+    q = torch.randn(batch_size, num_heads_q, seq_len_q_padded, head_dim, dtype=dtype, device=device)
+    k = torch.randn(batch_size, num_heads_k, seq_len_k_padded, head_dim, dtype=dtype, device=device)
+    v = torch.randn(batch_size, num_heads_k, seq_len_k_padded, head_dim, dtype=dtype, device=device)
     
     results = {}
     errors = {}
@@ -1139,7 +1341,18 @@ def verify_correctness(
         results['flash_col_sum_sequential'] = {'output': output_col_seq, 'col_sum': col_sum_seq}
     except Exception as e:
         print(f"    ✗ + Col Sum Sequential failed: {e}")
-    
+
+    # 5b. Flash Attention with Col Softmax Sum
+    try:
+        torch.manual_seed(42)
+        q_col_softmax = q.clone()
+        k_col_softmax = k.clone()
+        v_col_softmax = v.clone()
+        output_col_softmax, col_softmax_sum = attention_with_softmax_col_sum(q_col_softmax, k_col_softmax, v_col_softmax, causal=causal)
+        results['flash_col_softmax_sum'] = {'output': output_col_softmax, 'col_softmax_sum': col_softmax_sum}
+    except Exception as e:
+        print(f"    ✗ + Col Softmax Sum failed: {e}")
+
     # 6. Flash Attention with Col Sum Softmax
     try:
         torch.manual_seed(42)
@@ -1891,7 +2104,23 @@ def run_benchmark_suite(
                     num_runs=num_runs,
                     device=device,
                 )
-                
+
+                print("  [+ Col Softmax Sum (Sequential)]")
+                col_softmax_sum_result = benchmark_col_softmax_sum(
+                    batch_size=config['batch_size'],
+                    num_heads_q=config['num_heads_q'],
+                    num_heads_k=config['num_heads_k'],
+                    seq_len_q=config['seq_len_q'],
+                    seq_len_k=config['seq_len_k'],
+                    head_dim=config['head_dim'],
+                    causal=causal,
+                    dtype=dtype,
+                    warmup_ms=warmup_ms,
+                    rep_ms=rep_ms,
+                    num_runs=num_runs,
+                    device=device,
+                )
+
                 print("  [+ Cross-Token Softmax Sum]")
                 cross_token_softmax_result = benchmark_cross_token_softmax(
                     batch_size=config['batch_size'],
@@ -1960,6 +2189,7 @@ def run_benchmark_suite(
                 row_sum_speedup = naive_time / row_sum_result["median_time_ms"] if naive_time != float("inf") and row_sum_result["median_time_ms"] != float("inf") else 0.0
                 col_sum_speedup = naive_time / col_sum_result["median_time_ms"] if naive_time != float("inf") and col_sum_result["median_time_ms"] != float("inf") else 0.0
                 col_sum_sequential_speedup = naive_time / col_sum_sequential_result["median_time_ms"] if naive_time != float("inf") and col_sum_sequential_result["median_time_ms"] != float("inf") else 0.0
+                col_softmax_sum_speedup = naive_time / col_softmax_sum_result["median_time_ms"] if naive_time != float("inf") and col_softmax_sum_result["median_time_ms"] != float("inf") else 0.0
                 cross_token_softmax_speedup = naive_time / cross_token_softmax_result["median_time_ms"] if naive_time != float("inf") and cross_token_softmax_result["median_time_ms"] != float("inf") else 0.0
                 cross_token_softmax_buffered_speedup = naive_time / cross_token_softmax_buffered_result["median_time_ms"] if naive_time != float("inf") and cross_token_softmax_buffered_result["median_time_ms"] != float("inf") else 0.0
                 cross_token_qk_speedup = naive_time / cross_token_qk_result["median_time_ms"] if naive_time != float("inf") and cross_token_qk_result["median_time_ms"] != float("inf") else 0.0
@@ -1967,19 +2197,22 @@ def run_benchmark_suite(
                 print(f"    Row Sum: {row_sum_result['median_time_ms']:.3f}ms ({row_sum_speedup:.2f} vs Naive), "
                       f"Col Sum (Reverse): {col_sum_result['median_time_ms']:.3f}ms ({col_sum_speedup:.2f} vs Naive)")
                 print(f"    Col Sum (Sequential): {col_sum_sequential_result['median_time_ms']:.3f}ms ({col_sum_sequential_speedup:.2f} vs Naive), "
-                      f"Cross-Token Softmax: {cross_token_softmax_result['median_time_ms']:.3f}ms ({cross_token_softmax_speedup:.2f} vs Naive)")
-                print(f"    Cross-Token Softmax (Buffered): {cross_token_softmax_buffered_result['median_time_ms']:.3f}ms ({cross_token_softmax_buffered_speedup:.2f} vs Naive), "
-                      f"Cross-Token QK: {cross_token_qk_result['median_time_ms']:.3f}ms ({cross_token_qk_speedup:.2f} vs Naive)")
+                      f"Col Softmax Sum: {col_softmax_sum_result['median_time_ms']:.3f}ms ({col_softmax_sum_speedup:.2f} vs Naive)")
+                print(f"    Cross-Token Softmax: {cross_token_softmax_result['median_time_ms']:.3f}ms ({cross_token_softmax_speedup:.2f} vs Naive), "
+                      f"Cross-Token Softmax (Buffered): {cross_token_softmax_buffered_result['median_time_ms']:.3f}ms ({cross_token_softmax_buffered_speedup:.2f} vs Naive)")
+                print(f"    Cross-Token QK: {cross_token_qk_result['median_time_ms']:.3f}ms ({cross_token_qk_speedup:.2f} vs Naive)")
                 
                 results[-1]["row_sum"] = row_sum_result
                 results[-1]["col_sum"] = col_sum_result
                 results[-1]["col_sum_sequential"] = col_sum_sequential_result
+                results[-1]["col_softmax_sum"] = col_softmax_sum_result
                 results[-1]["cross_token_softmax"] = cross_token_softmax_result
                 results[-1]["cross_token_softmax_buffered"] = cross_token_softmax_buffered_result
                 results[-1]["cross_token_qk"] = cross_token_qk_result
                 results[-1]["row_sum_speedup"] = row_sum_speedup
                 results[-1]["col_sum_speedup"] = col_sum_speedup
                 results[-1]["col_sum_sequential_speedup"] = col_sum_sequential_speedup
+                results[-1]["col_softmax_sum_speedup"] = col_softmax_sum_speedup
                 results[-1]["cross_token_softmax_speedup"] = cross_token_softmax_speedup
                 results[-1]["cross_token_softmax_buffered_speedup"] = cross_token_softmax_buffered_speedup
                 results[-1]["cross_token_qk_speedup"] = cross_token_qk_speedup
@@ -2006,6 +2239,7 @@ def run_benchmark_suite(
             "+ Row Sum",
             "+ Col Sum (Reverse)",
             "+ Col Sum (Sequential)",
+            "+ Col Softmax Sum (Sequential)",
             "+ Cross-Token Softmax Sum",
             "+ Cross-Token Softmax Sum (Buffered)",
             "+ Cross-Token QK Sum"
@@ -2042,6 +2276,7 @@ def run_benchmark_suite(
             row_sum_time = result.get("row_sum", {}).get("median_time_ms", float("inf"))
             col_sum_time = result.get("col_sum", {}).get("median_time_ms", float("inf"))
             col_sum_sequential_time = result.get("col_sum_sequential", {}).get("median_time_ms", float("inf"))
+            col_softmax_sum_time = result.get("col_softmax_sum", {}).get("median_time_ms", float("inf"))
             cross_token_softmax_time = result.get("cross_token_softmax", {}).get("median_time_ms", float("inf"))
             cross_token_softmax_buffered_time = result.get("cross_token_softmax_buffered", {}).get("median_time_ms", float("inf"))
             cross_token_qk_time = result.get("cross_token_qk", {}).get("median_time_ms", float("inf"))
@@ -2049,6 +2284,7 @@ def run_benchmark_suite(
             row_sum_speedup = result.get("row_sum_speedup", 0.0)
             col_sum_speedup = result.get("col_sum_speedup", 0.0)
             col_sum_sequential_speedup = result.get("col_sum_sequential_speedup", 0.0)
+            col_softmax_sum_speedup = result.get("col_softmax_sum_speedup", 0.0)
             cross_token_softmax_speedup = result.get("cross_token_softmax_speedup", 0.0)
             cross_token_softmax_buffered_speedup = result.get("cross_token_softmax_buffered_speedup", 0.0)
             cross_token_qk_speedup = result.get("cross_token_qk_speedup", 0.0)
@@ -2061,7 +2297,10 @@ def run_benchmark_suite(
             
             method_data["+ Col Sum (Sequential)"]["times"].append((config_label, col_sum_sequential_time))
             method_data["+ Col Sum (Sequential)"]["speedups"].append((config_label, col_sum_sequential_speedup))
-            
+
+            method_data["+ Col Softmax Sum (Sequential)"]["times"].append((config_label, col_softmax_sum_time))
+            method_data["+ Col Softmax Sum (Sequential)"]["speedups"].append((config_label, col_softmax_sum_speedup))
+
             method_data["+ Cross-Token Softmax Sum"]["times"].append((config_label, cross_token_softmax_time))
             method_data["+ Cross-Token Softmax Sum"]["speedups"].append((config_label, cross_token_softmax_speedup))
 
@@ -2185,10 +2424,13 @@ def main():
                         help="Skip correctness verification")
     parser.add_argument("--tolerance", type=float, default=1e-2,
                         help="Tolerance for correctness verification (default: 1e-2)")
-    
+    parser.add_argument("--split", type=int, default=768,
+                        help="Split position for cross-token operators (default: 768)")
+
     args = parser.parse_args()
     
     # Qwen3 8B configuration
+    # Add split parameter to each config
     test_configs = [
         {
             "name": "Qwen3 8B - 1K",
@@ -2200,6 +2442,7 @@ def main():
             "head_dim": 128,
             "causal": True,
             "dtype": torch.float16,
+            "split": args.split,
         },
         {
             "name": "Qwen3 8B - 2K",
@@ -2211,6 +2454,7 @@ def main():
             "head_dim": 128,
             "causal": True,
             "dtype": torch.float16,
+            "split": args.split,
         },
         {
             "name": "Qwen3 8B - 4K",
@@ -2222,6 +2466,7 @@ def main():
             "head_dim": 128,
             "causal": True,
             "dtype": torch.float16,
+            "split": args.split,
         },
         {
             "name": "Qwen3 8B - 8K",
@@ -2233,6 +2478,7 @@ def main():
             "head_dim": 128,
             "causal": True,
             "dtype": torch.float16,
+            "split": args.split,
         },
     ]
     

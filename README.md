@@ -7,7 +7,7 @@ An efficient attention implementation that returns both attention output and att
 - **High Performance**: Uses Flash Attention v2 for efficient attention computation
 - **Fused Score Computation**: Computes both attention output and scores in a single kernel call, avoiding duplicate computation of Q @ K^T
 - **Score Extraction**: Returns attention scores (Q @ K^T * sm_scale) with proper causal masking support
-- **Row-wise and Column-wise Score Sums**: Efficiently compute attention score sums along rows and columns
+- **Row-wise and Column-wise Score Sums**: Efficiently compute attention score sums along rows and columns (both raw scores and softmax-normalized weights)
 - **Split QK Sum**: Compute cross-segment attention scores (raw scores from queries after split to keys before split)
 - **Cross-Token Softmax Sum**: Compute cross-segment softmax attention weights (normalized softmax weights from queries after split to keys before split)
 - **Multiple Implementations**: Includes Flash Attention, PyTorch SDPA, and naive reference implementations
@@ -138,6 +138,7 @@ Benchmark results on Qwen3 8B configuration (causal attention, head_dim=128):
 - `attention_with_row_sum.py`: Row-wise score sum computation
 - `attention_with_col_sum.py`: Column-wise score sum computation with reverse-order processing for causal attention and Round-Robin for non-causal (recommended for causal attention)
 - `attention_with_col_sum_sequential.py`: Column-wise score sum computation with Round-Robin processing for all cases
+- `attention_with_col_softmax_sum.py`: Column-wise softmax-normalized score sum computation (two-pass implementation for computing normalized attention weights)
 - `attention_cross_token_qk_sum.py`: Cross-token QK sum computation (raw scores from queries after split to keys before split)
 - `attention_cross_token_softmax_sum.py`: Cross-token softmax sum computation (normalized softmax weights from queries after split to keys before split), includes both recomputation and buffered versions
 - `flash.py`: Core Flash Attention v2 implementation
@@ -323,6 +324,66 @@ def attention_with_col_sum_sequential(
 
 - **`attention_with_col_sum`**: Uses reverse-order processing in causal mode and Round-Robin in non-causal mode. Recommended for causal attention where reverse-order provides optimal performance.
 - **`attention_with_col_sum_sequential`**: Uses Round-Robin processing for all cases (both causal and non-causal). Simpler implementation with consistent processing strategy across all modes.
+
+### `attention_with_softmax_col_sum`
+
+Computes attention output and column-wise **softmax-normalized** attention score sums using a two-pass sequential processing approach.
+
+The result has shape `(batch_size, num_heads_k, seq_len_k)`, where each element represents the sum of **softmax-normalized** attention scores for a specific key position across all query positions.
+
+**Key Difference from `attention_with_col_sum`:**
+
+- **`attention_with_col_sum`**: Accumulates raw attention scores (before softmax normalization)
+- **`attention_with_softmax_col_sum`**: Accumulates softmax-normalized attention probabilities
+  - The output represents actual attention weights used in the final computation
+  - Requires two-pass implementation (first pass computes softmax statistics, second pass accumulates normalized weights)
+
+**Implementation Details:**
+
+- **Pass 1**: Computes standard Flash Attention output and normalization statistics (m_i, l_i)
+- **Pass 2**: Re-streams K, recomputes QK^T scores, applies softmax normalization using statistics from Pass 1, and accumulates column sums
+- Multiple query blocks write to the same column positions, requiring atomic operations (`tl.atomic_add`)
+- Uses Round-Robin processing for consistent performance across all modes
+- **QK^T Recomputation**: Pass 2 recomputes QK^T rather than buffering from Pass 1
+  - Modern GPUs have abundant compute resources but limited memory bandwidth
+  - L2 cache provides effective reuse of K between passes
+  - Avoids shared memory pressure from storing intermediate QK^T results
+
+```python
+def attention_with_softmax_col_sum(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    causal: bool = False,
+    sm_scale: float = None,
+    dropout_p: float = 0.0,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Compute attention output using Flash Attention, while also returning column-wise softmax-normalized attention score sum.
+    Uses sequential (forward-order) processing for all cases, including causal attention.
+
+    Args:
+        q: Query tensor, shape (batch_size, num_heads_q, seq_len_q, head_dim)
+        k: Key tensor, shape (batch_size, num_heads_k, seq_len_k, head_dim)
+        v: Value tensor, shape (batch_size, num_heads_k, seq_len_k, head_dim)
+        causal: Whether to use causal mask
+        sm_scale: Scaling factor, if None uses 1/sqrt(head_dim)
+        dropout_p: Dropout probability
+
+    Returns:
+        output: Attention output, shape (batch_size, num_heads_q, seq_len_q, head_dim)
+        col_sum: Column-wise softmax-normalized attention score sum, shape (batch_size, num_heads_k, seq_len_k)
+                 Each value is the sum of softmax-normalized attention scores for that key position across all queries
+
+    Note:
+        This version uses sequential processing for all cases. For causal attention, consider using
+        `attention_with_col_sum` which uses reverse-order processing to reduce atomic contention.
+
+    ⚠️ Precision Warning:
+        The col sum computation may introduce numerical errors due to floating-point accumulation.
+        Relative error of the sum can be around 1e-3.
+    """
+```
 
 ### `attention_cross_token_qk_sum`
 
@@ -529,11 +590,14 @@ def attention_cross_token_softmax_sum(
 ```
 
 **Performance Characteristics:**
-- Two-pass kernel architecture introduces ~173% overhead compared to base Flash Attention
-- Pass 1: Computes m_i and l_i (required for correct softmax normalization)
-- Pass 2: Computes final softmax and accumulates to cross-token sum
+- **Optimized fused kernel architecture**: Combines attention output computation with cross-token sum in a single kernel
+- **Reduced QK^T computations**: 2 passes instead of 3 (compared to previous non-fused implementation)
+- **Single kernel launch**: Eliminates the overhead of calling `attention()` separately
+- Pass 1: Computes attention output (O) and normalization statistics (m_i, l_i)
+- Pass 2: Recomputes QK^T for keys < split, applies softmax using cached m_i/l_i, accumulates cross-token sum
 - L2 cache helps Pass 2 K loads (K tensors are likely still in cache from Pass 1)
 - Recomputation approach is faster than storing QK^T due to GPU memory bandwidth constraints
+- **Performance**: Comparable to `attention_with_softmax_col_sum` (~2-3× overhead vs base Flash Attention)
 
 ### `attention_cross_token_softmax_sum_buffered`
 
