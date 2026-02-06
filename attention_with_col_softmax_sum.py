@@ -249,6 +249,10 @@ def _fwd_kernel_with_col_sum_sequential(
             if not DIVISIBLE_N:
                 mask_n = offs_n < N
                 p = tl.where(mask_n[None, :], p, 0.0)
+                
+            if not DIVISIBLE_M:
+                mask_m = offs_m < M
+                p = tl.where(mask_m[:, None], p, 0.0)
 
             if IS_CAUSAL:
                 causal_mask = (P_SEQ + offs_m[:, None]) >= offs_n[None, :]

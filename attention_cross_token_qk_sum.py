@@ -183,7 +183,10 @@ def _fwd_kernel_cross_token_qk(
                     # Apply boundary mask (if key exceeds N, set to 0)
                     if not DIVISIBLE_N:
                         split_mask = split_mask & mask_n[None, :]
-                    
+
+                    if not DIVISIBLE_M:
+                        split_mask = split_mask & mask_m[:,None]
+
                     # Apply causal mask (if query < key, set to 0)
                     if IS_CAUSAL:
                         split_mask = split_mask & causal_mask

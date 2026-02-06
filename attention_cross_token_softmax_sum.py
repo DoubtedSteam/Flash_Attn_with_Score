@@ -224,7 +224,7 @@ def _cross_token_weights_sum_kernel_fused(
 
                 # Compute QK^T
                 s = tl.dot(q, k)
-
+                    
                 # Apply masks
                 if not DIVISIBLE_N:
                     mask_n = offs_n < N
@@ -239,9 +239,15 @@ def _cross_token_weights_sum_kernel_fused(
 
                 # Apply split mask: only queries >= split_pos contribute to keys < split_pos
                 split_mask = is_query_after_split[:, None] & mask_n_before_split[None, :]
+
+                if not DIVISIBLE_M:
+                    mask_m = offs_m < M
+                    split_mask = split_mask & mask_m[:, None]
+
                 if not DIVISIBLE_N:
                     mask_n = offs_n < N
                     split_mask = split_mask & mask_n[None, :]
+                    
                 if IS_CAUSAL:
                     causal_mask = (P_SEQ + offs_m[:, None]) >= offs_n[None, :]
                     split_mask = split_mask & causal_mask
@@ -596,6 +602,11 @@ def _cross_token_weights_sum_kernel_buffered(
                     if not DIVISIBLE_N:
                         mask_n = offs_n < N
                         split_mask = split_mask & mask_n[None, :]
+
+                    if not DIVISIBLE_M:
+                        mask_m = offs_m < M
+                        split_mask = split_mask & mask_m[:,None]
+
                     if IS_CAUSAL:
                         causal_mask = (P_SEQ + offs_m[:, None]) >= offs_n[None, :]
                         split_mask = split_mask & causal_mask
