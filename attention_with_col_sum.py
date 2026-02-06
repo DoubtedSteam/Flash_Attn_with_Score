@@ -175,7 +175,7 @@ def _fwd_kernel_with_col_sum(
                 # Sum over queries dimension (dim=0), get (BLOCK_N,) - local sum for each key position
                 col_sum_block = tl.sum(s_for_sum, 0)  # (BLOCK_N,)
 
-                # -- 数值稳定的 softmax --
+                # -- Numerically stable softmax --
                 m_i_new = tl.maximum(m_i, tl.max(s, 1))
                 alpha = tl.math.exp2((m_i - m_i_new) * qk_scale)
                 p = tl.math.exp2(s * qk_scale - m_i_new[:, None] * qk_scale)
@@ -196,7 +196,7 @@ def _fwd_kernel_with_col_sum(
                     pmask = tl.rand(seed, offs_rng, n_rounds=6) > dropout_p
                     p *= pmask.to(tl.float32)
 
-                # -- 更新累加器 --
+                # -- Update accumulators --
                 acc *= alpha[:, None]
                 acc += tl.dot(p.to(input_dtype), v)
                 l_i = l_i * alpha + p_sum
@@ -249,7 +249,7 @@ def _fwd_kernel_with_col_sum(
                 # Sum over queries dimension (dim=0), get (BLOCK_N,) - local sum for each key position
                 col_sum_block = tl.sum(s_for_sum, 0)  # (BLOCK_N,)
 
-                # -- 数值稳定的 softmax --
+                # -- Numerically stable softmax --
                 m_i_new = tl.maximum(m_i, tl.max(s, 1))
                 alpha = tl.math.exp2((m_i - m_i_new) * qk_scale)
                 p = tl.math.exp2(s * qk_scale - m_i_new[:, None] * qk_scale)
@@ -270,7 +270,7 @@ def _fwd_kernel_with_col_sum(
                     pmask = tl.rand(seed, offs_rng, n_rounds=6) > dropout_p
                     p *= pmask.to(tl.float32)
 
-                # -- 更新累加器 --
+                # -- Update accumulators --
                 acc *= alpha[:, None]
                 acc += tl.dot(p.to(input_dtype), v)
                 l_i = l_i * alpha + p_sum

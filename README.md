@@ -8,7 +8,8 @@ An efficient attention implementation that returns both attention output and att
 - **Fused Score Computation**: Computes both attention output and scores in a single kernel call, avoiding duplicate computation of Q @ K^T
 - **Score Extraction**: Returns attention scores (Q @ K^T * sm_scale) with proper causal masking support
 - **Row-wise and Column-wise Score Sums**: Efficiently compute attention score sums along rows and columns
-- **Split QK Sum**: Compute cross-segment attention scores (scores from queries after split to keys before split)
+- **Split QK Sum**: Compute cross-segment attention scores (raw scores from queries after split to keys before split)
+- **Cross-Token Softmax Sum**: Compute cross-segment softmax attention weights (normalized softmax weights from queries after split to keys before split)
 - **Multiple Implementations**: Includes Flash Attention, PyTorch SDPA, and naive reference implementations
 - **Comprehensive Benchmarking**: Built-in benchmark suite for performance comparison
 - **GQA Support**: Supports Grouped Query Attention (GQA)
@@ -68,7 +69,9 @@ The benchmark compares:
 - **Row Sum**: Flash Attention with row-wise score sum computation
 - **Col Sum (Reverse-Order)**: Flash Attention with column-wise score sum using reverse-order processing for causal attention and Round-Robin for non-causal (recommended for causal attention)
 - **Col Sum (Sequential)**: Flash Attention with column-wise score sum using Round-Robin processing for all cases
-- **Split QK Sum**: Flash Attention with split QK sum computation (scores from queries after split to keys before split), optimized with Round-Robin processing
+- **Cross-Token QK Sum**: Flash Attention with split-based raw score sum (scores from queries after split to keys before split), optimized with Round-Robin processing
+- **Cross-Token Softmax Sum**: Flash Attention with split-based softmax weight sum (normalized weights from queries after split to keys before split), uses two-pass kernel
+- **Cross-Token Softmax Sum (Buffered)**: Flash Attention with split-based softmax weight sum, buffered version that stores QK^T between passes
 
 By default, the benchmark includes all operators. Use `--no-sum-ops` to disable sum operators benchmarking.
 
@@ -77,9 +80,6 @@ By default, the benchmark includes all operators. Use `--no-sum-ops` to disable 
 ```bash
 # Basic benchmark
 python benchmark.py
-
-# Disable sum operators benchmarking
-python benchmark.py --no-sum-ops
 
 # Enable configuration search for optimal kernel parameters
 python benchmark.py --enable-config-search
@@ -139,7 +139,8 @@ Flash Attention + Split QK Sum                0.159        4.22x        0.424   
 - `attention_with_row_sum.py`: Row-wise score sum computation
 - `attention_with_col_sum.py`: Column-wise score sum computation with reverse-order processing for causal attention and Round-Robin for non-causal (recommended for causal attention)
 - `attention_with_col_sum_sequential.py`: Column-wise score sum computation with Round-Robin processing for all cases
-- `attention_split_qk_sum.py`: Split QK sum computation (scores from queries after split to keys before split)
+- `attention_cross_token_qk_sum.py`: Cross-token QK sum computation (raw scores from queries after split to keys before split)
+- `attention_cross_token_softmax_sum.py`: Cross-token softmax sum computation (normalized softmax weights from queries after split to keys before split), includes both recomputation and buffered versions
 - `flash.py`: Core Flash Attention v2 implementation
 - `total.py`, `split_kv.py`, `dropout.py`: Supporting modules
 
@@ -324,13 +325,13 @@ def attention_with_col_sum_sequential(
 - **`attention_with_col_sum`**: Uses reverse-order processing in causal mode and Round-Robin in non-causal mode. Recommended for causal attention where reverse-order provides optimal performance.
 - **`attention_with_col_sum_sequential`**: Uses Round-Robin processing for all cases (both causal and non-causal). Simpler implementation with consistent processing strategy across all modes.
 
-### `attention_split_qk_sum`
+### `attention_cross_token_qk_sum`
 
-Computes attention output and split QK sum, which accumulates scores from queries after the split position to keys before the split position.
+Computes attention output and cross-token QK sum, which accumulates raw attention scores from queries after the split position to keys before the split position.
 
-**Split QK Sum Output:**
+**Cross-Token QK Sum Output:**
 
-The split QK sum computes the cross attention scores from tokens after the split position to tokens before the split position.
+The cross-token QK sum computes the cross attention scores from tokens after the split position to tokens before the split position.
 
 Given the attention scores \( S \in \mathbb{R}^{B \times H_q \times M \times N} \) and a split position \( \text{split} \), the split QK sum is defined as:
 
@@ -371,7 +372,7 @@ The output tensor has shape \( (B, H_k, \text{split}) \), where each element rep
   - Skips computation for key blocks entirely outside the split range
 
 ```python
-def attention_split_qk_sum(
+def attention_cross_token_qk_sum(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -381,44 +382,44 @@ def attention_split_qk_sum(
     dropout_p: float = 0.0,
     *,
     out: torch.Tensor | None = None,
-    split_qk_sum_out: torch.Tensor | None = None,
+    cross_token_qk_out: torch.Tensor | None = None,
     reuse_buffers: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
-    Compute attention output and split QK sum using fused Flash Attention kernel.
+    Compute attention output and cross-token QK sum using fused Flash Attention kernel.
     Computes both in a single kernel call, avoiding duplicate computation of Q @ K^T.
-    
+
     Args:
         q: Query tensor, shape (batch_size, num_heads_q, seq_len_q, head_dim)
         k: Key tensor, shape (batch_size, num_heads_k, seq_len_k, head_dim)
         v: Value tensor, shape (batch_size, num_heads_k, seq_len_k, head_dim)
-        split: Split position. split_qk_sum computes scores from queries [split:] to keys [:split]
+        split: Split position. cross_token_qk computes scores from queries [split:] to keys [:split]
         causal: Whether to use causal mask
         sm_scale: Scaling factor, if None uses 1/sqrt(head_dim)
         dropout_p: Dropout probability
         out: Optional output buffer, must have same shape as q
-        split_qk_sum_out: Optional split_qk_sum output buffer, must have shape (B, Hk, split)
+        cross_token_qk_out: Optional cross_token_qk output buffer, must have shape (B, Hk, split)
         reuse_buffers: Whether to reuse buffers (currently unused)
-    
+
     Returns:
         output: Attention output, shape (batch_size, num_heads_q, seq_len_q, head_dim)
-        split_qk_sum: Split QK sum, shape (batch_size, num_heads_k, split)
-                      **Meaning**: Each value `split_qk_sum[b, h_k, j]` represents the **accumulated sum** 
-                      of attention scores from **ALL queries after the split position** (queries at 
-                      positions [split, split+1, ..., seq_len_q-1]) to the specific key position `j` 
+        cross_token_qk: Cross-token QK sum, shape (batch_size, num_heads_k, split)
+                      **Meaning**: Each value `cross_token_qk[b, h_k, j]` represents the **accumulated sum**
+                      of raw attention scores from **ALL queries after the split position** (queries at
+                      positions [split, split+1, ..., seq_len_q-1]) to the specific key position `j`
                       (where j < split).
-                      
-                      This sum indicates the total attention weight that all later tokens (after split) 
+
+                      This sum indicates the total raw attention score that all later tokens (after split)
                       collectively assign to each earlier token (before split) at position j.
-    
+
     Example:
         >>> q = torch.randn(1, 32, 1024, 128, dtype=torch.float16, device="cuda")
         >>> k = torch.randn(1, 32, 1024, 128, dtype=torch.float16, device="cuda")
         >>> v = torch.randn(1, 32, 1024, 128, dtype=torch.float16, device="cuda")
-        >>> output, split_qk_sum = attention_split_qk_sum(q, k, v, split=768, causal=True)
+        >>> output, cross_token_qk = attention_cross_token_qk_sum(q, k, v, split=768, causal=True)
         >>> print(f"Output shape: {output.shape}")  # (1, 32, 1024, 128)
-        >>> print(f"Split QK Sum shape: {split_qk_sum.shape}")  # (1, 32, 768)
-        >>> # split_qk_sum[0, 0, 100] contains the SUM of scores from ALL queries [768:1024] to key 100
+        >>> print(f"Cross-token QK Sum shape: {cross_token_qk.shape}")  # (1, 32, 768)
+        >>> # cross_token_qk[0, 0, 100] contains the SUM of scores from ALL queries [768:1024] to key 100
         >>> # This represents how much total attention all tokens after position 768 pay to token 100
     """
 ```
@@ -428,6 +429,171 @@ def attention_split_qk_sum(
 - Uses Round-Robin processing for key blocks before split
 - Reduces atomic operation frequency through precise masking
 - Performance is comparable to or better than `attention_with_scores`
+
+### `attention_cross_token_softmax_sum`
+
+Computes attention output and cross-token softmax sum, which accumulates normalized softmax attention weights from queries after the split position to keys before the split position.
+
+**Cross-Token Softmax Sum Output:**
+
+The cross-token softmax sum computes the cross attention softmax weights from tokens after the split position to tokens before the split position.
+
+Given the softmax-normalized attention weights \( \text{Softmax}(QK^T) \in \mathbb{R}^{B \times H_q \times M \times N} \) and a split position \( \text{split} \), the cross-token softmax sum is defined as:
+
+\[
+\text{cross\_token\_softmax\_sum}[b, h_k, j] = \sum_{i=\text{split}}^{M-1} \text{Softmax}(QK^T)[b, h_q, i, j] \quad \text{for } j \in [0, \text{split})
+\]
+
+where:
+- \( b \in [0, B) \): batch index
+- \( h_k \in [0, H_k) \): key head index
+- \( h_q \in [0, H_q) \): query head index (for GQA, multiple query heads may map to the same key head)
+- \( i \in [\text{split}, M) \): query position index (only queries after split)
+- \( j \in [0, \text{split}) \): key position index (only keys before split)
+- \( M, N \): sequence lengths for queries and keys respectively
+
+The output tensor has shape \( (B, H_k, \text{split}) \), where each element represents the **accumulated sum** of normalized softmax attention weights from all query positions after the split to a specific key position before the split. This provides a quantitative measure of the total normalized attention weight that all later tokens (after split) collectively assign to each earlier token (before split).
+
+**Difference from `attention_cross_token_qk_sum`:**
+- `attention_cross_token_qk_sum`: Sums **raw attention scores** (QK^T * scale)
+- `attention_cross_token_softmax_sum`: Sums **softmax-normalized weights** (values between 0 and 1 that sum to 1 across keys for each query)
+
+**Use Cases:**
+- Cross-segment attention analysis: Understanding normalized attention flow from later to earlier tokens
+- Attention pattern analysis: Analyzing how much normalized attention weight flows between sequence segments
+- Model interpretability: Understanding the relative importance of earlier tokens for later tokens
+
+**Implementation Details:**
+- Uses a **two-pass kernel architecture**:
+  - **Pass 1**: Computes QK^T for all key blocks, tracking max (m_i) and sum (l_i) for softmax normalization
+  - **Pass 2**: Recomputes QK^T, applies softmax normalization using m_i and l_i, and accumulates to cross-token sum
+- **Why two passes?** Softmax normalization requires knowing the global max and sum across all keys, which is only available after processing all key blocks
+- Uses atomic operations (`tl.atomic_add`) to accumulate weights from multiple query blocks
+- Only queries after the split position contribute to the sum
+- Only keys before the split position are included in the sum
+- Masked positions (causal mask or boundary mask) are set to 0 before summation
+- Atomic operations are only executed when necessary
+  - Only executed when query block contains queries after split
+  - Uses precise masks to reduce actual atomic writes to relevant key positions only
+  - Skips computation for key blocks entirely outside the split range
+
+```python
+def attention_cross_token_softmax_sum(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    split: int,
+    causal: bool = False,
+    sm_scale: float = None,
+    dropout_p: float = 0.0,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Compute attention output using Flash Attention, while also returning cross-token softmax weight sum.
+
+    Computes split-based cross-token softmax weights: only queries >= split contribute to keys < split.
+    This is useful for analyzing normalized attention patterns between different segments of the sequence.
+
+    Args:
+        q: Query tensor, shape (batch_size, num_heads_q, seq_len_q, head_dim)
+        k: Key tensor, shape (batch_size, num_heads_k, seq_len_k, head_dim)
+        v: Value tensor, shape (batch_size, num_heads_k, seq_len_k, head_dim)
+        split: Split position - queries >= split contribute to keys < split
+        causal: Whether to use causal mask
+        sm_scale: Scaling factor, if None uses 1/sqrt(head_dim)
+        dropout_p: Dropout probability
+
+    Returns:
+        output: Attention output, shape (batch_size, num_heads_q, seq_len_q, head_dim)
+        cross_token_softmax_sum: Cross-token softmax weight sum, shape (batch_size, num_heads_k, split)
+                                For each key position j < split:
+                                cross_token_softmax_sum[b, h_k, j] = sum over i >= split of softmax(QK^T)[b, h_q, i, j]
+
+    Note:
+        This implementation uses two separate operations:
+        1. Flash Attention for computing the output (optimized, no scores needed)
+        2. A fused Triton kernel for computing QK^T + softmax + cross-token sum
+
+        While this requires computing QK^T twice (once for attention output, once for softmax sum),
+        it's still much faster than materializing the full attention_weights matrix and ensures
+        numerical correctness.
+
+    Example:
+        >>> q = torch.randn(1, 32, 1024, 128, dtype=torch.float16, device="cuda")
+        >>> k = torch.randn(1, 32, 1024, 128, dtype=torch.float16, device="cuda")
+        >>> v = torch.randn(1, 32, 1024, 128, dtype=torch.float16, device="cuda")
+        >>> output, cross_token_softmax = attention_cross_token_softmax_sum(q, k, v, split=768, causal=True)
+        >>> print(f"Output shape: {output.shape}")  # (1, 32, 1024, 128)
+        >>> print(f"Cross-token Softmax Sum shape: {cross_token_softmax.shape}")  # (1, 32, 768)
+        >>> # cross_token_softmax[0, 0, 100] contains the SUM of softmax weights from queries [768:1024] to key 100
+        >>> # Values are normalized (each query's weights sum to 1 across all keys)
+    """
+```
+
+**Performance Characteristics:**
+- Two-pass kernel architecture introduces ~173% overhead compared to base Flash Attention
+- Pass 1: Computes m_i and l_i (required for correct softmax normalization)
+- Pass 2: Computes final softmax and accumulates to cross-token sum
+- L2 cache helps Pass 2 K loads (K tensors are likely still in cache from Pass 1)
+- Recomputation approach is faster than storing QK^T due to GPU memory bandwidth constraints
+
+### `attention_cross_token_softmax_sum_buffered`
+
+Buffered version of `attention_cross_token_softmax_sum` that stores QK^T in a global memory buffer during Pass 1 and loads it in Pass 2, avoiding recomputation.
+
+**Difference from standard version:**
+- **Standard version (`attention_cross_token_softmax_sum`)**: Recomputes QK^T in Pass 2
+- **Buffered version (`attention_cross_token_softmax_sum_buffered`)**: Stores QK^T in Pass 1, loads it in Pass 2
+
+**Trade-offs:**
+- **Saves compute**: Avoids recomputing QK^T in Pass 2 (~50% reduction in QK^T operations)
+- **Adds memory**: Requires additional buffer of size (B × H × M × N × 4 bytes) for QK^T storage
+- **Adds memory bandwidth**: Requires writing QK^T to global memory and reading it back
+- **Typically slower**: On modern GPUs, memory bandwidth is more precious than compute, so buffering is usually slower despite saving compute
+
+**When to use buffered version:**
+- When compute is the bottleneck (rare on modern GPUs)
+- When memory bandwidth is abundant relative to compute capacity
+- For experimentation and comparison purposes
+
+```python
+def attention_cross_token_softmax_sum_buffered(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    split: int,
+    causal: bool = False,
+    sm_scale: float = None,
+    dropout_p: float = 0.0,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Buffered version of attention_cross_token_softmax_sum.
+
+    This version stores QK^T in a global memory buffer during Pass 1
+    and loads it in Pass 2, avoiding recomputation.
+    Also computes attention output in the same fused kernel to reduce memory overhead.
+
+    Trade-off: Saves compute but requires extra memory bandwidth and storage.
+    Memory requirement: B × H × M × N × 4 bytes for QK^T buffer.
+
+    Args:
+        q: Query tensor, shape (batch_size, num_heads_q, seq_len_q, head_dim)
+        k: Key tensor, shape (batch_size, num_heads_k, seq_len_k, head_dim)
+        v: Value tensor, shape (batch_size, num_heads_k, seq_len_k, head_dim)
+        split: Split position - queries >= split contribute to keys < split
+        causal: Whether to use causal mask
+        sm_scale: Scaling factor, if None uses 1/sqrt(head_dim)
+        dropout_p: Dropout probability
+
+    Returns:
+        output: Attention output, shape (batch_size, num_heads_q, seq_len_q, head_dim)
+        cross_token_softmax_sum: Cross-token softmax weight sum, shape (batch_size, num_heads_k, split)
+    """
+```
+
+**Performance Notes:**
+- Typically slower than the recomputation version on modern GPUs (A100/H100)
+- Modern GPUs have abundant compute (FLOPs) but limited memory bandwidth
+- Provided for completeness and experimentation
 
 ## Replacing Standard Attention
 

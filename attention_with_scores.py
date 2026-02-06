@@ -1,6 +1,6 @@
 """
-Attention 模块：使用 Flash Attention 计算输出，同时返回 Attention Scores
-融合实现：在一次 kernel 调用中同时计算 attention 输出和 scores，避免重复计算 Q @ K^T
+Attention Module: Computes output using Flash Attention while also returning Attention Scores
+Fused implementation: Computes both attention output and scores in a single kernel call, avoiding redundant Q @ K^T computation
 """
 
 import math
@@ -38,8 +38,8 @@ def _fwd_kernel_with_scores(
     DIVISIBLE_M: tl.constexpr, DIVISIBLE_N: tl.constexpr,
 ):
     """
-    融合的 Flash Attention forward kernel，同时计算 attention 输出和 scores
-    避免重复计算 Q @ K^T
+    Fused Flash Attention forward kernel that computes both attention output and scores
+    Avoids redundant Q @ K^T computation
     """
     input_dtype = Q.dtype.element_ty
     # -- grid id --
@@ -128,7 +128,7 @@ def _fwd_kernel_with_scores(
         s = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
         s += tl.dot(q, k)
 
-        # 应用边界 mask（用于 attention 计算）
+        # Apply boundary mask (for attention computation)
         if not DIVISIBLE_N:
             mask_n = offs_n < N
             s = tl.where(mask_n[None, :], s, float("-inf"))
@@ -136,18 +136,18 @@ def _fwd_kernel_with_scores(
             causal_mask = (P_SEQ + offs_m[:, None]) >= offs_n[None, :]
             s = tl.where(causal_mask, s, float("-inf"))
 
-        # -- 保存 scores（应用缩放，mask 位置设为 0）--
-        # 计算用于保存的 scores：应用缩放，mask 位置设为 0
+        # -- Save scores (apply scaling, masked positions set to 0) --
+        # Compute scores for saving: apply scaling, masked positions set to 0
         s_for_scores = s * sm_scale
-        # 将 -inf 位置设为 0（用于 scores 输出）
+        # Set -inf positions to 0 (for scores output)
         if not DIVISIBLE_N:
             mask_n = offs_n < N
             s_for_scores = tl.where(mask_n[None, :], s_for_scores, 0.0)
         if IS_CAUSAL:
             causal_mask = (P_SEQ + offs_m[:, None]) >= offs_n[None, :]
             s_for_scores = tl.where(causal_mask, s_for_scores, 0.0)
-        
-        # 保存 scores
+
+        # Save scores
         if DIVISIBLE_M and DIVISIBLE_N:
             tl.store(scores_ptrs, s_for_scores.to(input_dtype), cache_modifier=".cg")
         elif DIVISIBLE_M:
@@ -220,21 +220,21 @@ def attention_with_scores(
     dropout_p: float = 0.0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
-    使用融合的 Flash Attention kernel 计算 attention 输出和 scores
-    在一次 kernel 调用中完成，避免重复计算 Q @ K^T
-    
+    Compute attention output and scores using fused Flash Attention kernel
+    Completes in a single kernel call, avoiding redundant Q @ K^T computation
+
     Args:
-        q: Query 张量，形状 (batch_size, num_heads_q, seq_len_q, head_dim)
-        k: Key 张量，形状 (batch_size, num_heads_k, seq_len_k, head_dim)
-        v: Value 张量，形状 (batch_size, num_heads_k, seq_len_k, head_dim)
-        causal: 是否使用因果 mask。如果为 True，scores 中被 mask 的位置会被设为 0
-        sm_scale: 缩放因子，如果为 None 则使用 1/sqrt(head_dim)
-        dropout_p: Dropout 概率（仅用于 attention 计算，不影响 scores）
-    
+        q: Query tensor, shape (batch_size, num_heads_q, seq_len_q, head_dim)
+        k: Key tensor, shape (batch_size, num_heads_k, seq_len_k, head_dim)
+        v: Value tensor, shape (batch_size, num_heads_k, seq_len_k, head_dim)
+        causal: Whether to use causal mask. If True, masked positions in scores will be set to 0
+        sm_scale: Scaling factor, if None uses 1/sqrt(head_dim)
+        dropout_p: Dropout probability (only used for attention computation, does not affect scores)
+
     Returns:
-        output: Attention 输出，形状 (batch_size, num_heads_q, seq_len_q, head_dim)
-        scores: Attention scores，形状 (batch_size, num_heads_q, seq_len_q, seq_len_k)
-                如果 causal=True，被 mask 的位置值为 0（而不是 -inf）
+        output: Attention output, shape (batch_size, num_heads_q, seq_len_q, head_dim)
+        scores: Attention scores, shape (batch_size, num_heads_q, seq_len_q, seq_len_k)
+                If causal=True, masked positions have value 0 (instead of -inf)
     """
     Dq, Dk, Dv = q.shape[-1], k.shape[-1], v.shape[-1]
     assert Dq == Dk == Dv, "feature size of q, k, v should be equal"

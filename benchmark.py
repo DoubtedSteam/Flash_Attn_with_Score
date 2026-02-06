@@ -27,7 +27,8 @@ from attention_with_scores import attention_with_scores
 from attention_with_row_sum import attention_with_row_sum
 from attention_with_col_sum import attention_with_col_sum
 from attention_with_col_sum_sequential import attention_with_col_sum_sequential
-from attention_split_qk_sum import attention_split_qk_sum
+from attention_cross_token_softmax_sum import attention_cross_token_softmax_sum, attention_cross_token_softmax_sum_buffered
+from attention_cross_token_qk_sum import attention_cross_token_qk_sum
 from reference_implementations import naive_attention_with_scores, pytorch_sdpa_attention_with_scores
 
 
@@ -150,9 +151,9 @@ def search_best_config(
                     return attention_with_col_sum(q, k, v, causal=causal, dropout_p=dropout_p)
                 elif implementation == "col_sum_sequential":
                     return attention_with_col_sum_sequential(q, k, v, causal=causal, dropout_p=dropout_p)
-                elif implementation == "split_qk_sum":
+                elif implementation == "cross_token_qk":
                     split = getattr(create_test_fn, 'split', 768)  # Default split value
-                    return attention_split_qk_sum(q, k, v, split=split, causal=causal, dropout_p=dropout_p)
+                    return attention_cross_token_qk_sum(q, k, v, split=split, causal=causal, dropout_p=dropout_p)
                 else:
                     raise ValueError(f"Unsupported implementation type: {implementation}")
         return test_fn
@@ -698,7 +699,205 @@ def benchmark_col_sum_sequential(
         }
 
 
-def benchmark_split_qk_sum(
+def benchmark_cross_token_softmax(
+    batch_size: int,
+    num_heads_q: int,
+    num_heads_k: int,
+    seq_len_q: int,
+    seq_len_k: int,
+    head_dim: int,
+    split: int,
+    causal: bool = False,
+    dropout_p: float = 0.0,
+    dtype: torch.dtype = torch.float16,
+    warmup_ms: int = 50,
+    rep_ms: int = 200,
+    num_runs: int = 3,
+    device: str = "cuda",
+) -> Dict[str, float]:
+    """
+    Benchmark attention_cross_token_softmax_sum implementation
+    """
+    if device != "cuda":
+        raise ValueError("do_bench only supports CUDA devices")
+
+    try:
+        q = torch.randn(batch_size, num_heads_q, seq_len_q, head_dim, dtype=dtype, device=device)
+        k = torch.randn(batch_size, num_heads_k, seq_len_k, head_dim, dtype=dtype, device=device)
+        v = torch.randn(batch_size, num_heads_k, seq_len_k, head_dim, dtype=dtype, device=device)
+
+        q = q.contiguous()
+        k = k.contiguous()
+        v = v.contiguous()
+
+        def fn():
+            return attention_cross_token_softmax_sum(q, k, v, split=split, causal=causal, dropout_p=dropout_p)
+        
+        all_run_times = []
+        total_runs_to_perform = num_runs + 2
+        
+        for run_idx in range(total_runs_to_perform):
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+            
+            # JIT compilation warmup
+            for _ in range(5):
+                _ = fn()
+            torch.cuda.synchronize()
+            
+            run_ms = do_bench(fn, warmup=warmup_ms, rep=rep_ms)
+            if run_ms != float("inf") and run_ms > 0:
+                all_run_times.append(run_ms)
+        
+        if len(all_run_times) >= num_runs:
+            # Use last num_runs results for statistics
+            run_times = sorted(all_run_times[-num_runs:])
+        else:
+            run_times = sorted(all_run_times) if all_run_times else [float("inf")]
+        
+        median_time_ms = run_times[len(run_times) // 2] if run_times else float("inf")
+        avg_time_ms = sum(run_times) / len(run_times) if run_times else float("inf")
+        min_time_ms = run_times[0] if run_times else float("inf")
+        max_time_ms = run_times[-1] if run_times else float("inf")
+        
+        total_tokens = batch_size * num_heads_q * seq_len_q
+        throughput = total_tokens / (median_time_ms / 1000) if median_time_ms != float("inf") else 0.0
+        
+        # Calculate TFLOPs (only matmul operations)
+        flops = 4 * batch_size * num_heads_q * seq_len_q * seq_len_k * head_dim
+        tflops = (flops / (median_time_ms / 1000)) / 1e12 if median_time_ms != float("inf") else 0.0
+        
+        return {
+            "avg_time_ms": avg_time_ms,
+            "median_time_ms": median_time_ms,
+            "min_time_ms": min_time_ms,
+            "max_time_ms": max_time_ms,
+            "throughput_tokens_per_sec": throughput,
+            "tflops": tflops,
+        }
+    
+    except torch.cuda.OutOfMemoryError:
+        return {
+            "avg_time_ms": float("inf"),
+            "median_time_ms": float("inf"),
+            "min_time_ms": float("inf"),
+            "max_time_ms": float("inf"),
+            "throughput_tokens_per_sec": 0.0,
+            "tflops": 0.0,
+        }
+    except Exception as e:
+        print(f"Error: {e}")
+        return {
+            "avg_time_ms": float("inf"),
+            "median_time_ms": float("inf"),
+            "min_time_ms": float("inf"),
+            "max_time_ms": float("inf"),
+            "throughput_tokens_per_sec": 0.0,
+            "tflops": 0.0,
+        }
+
+
+
+
+def benchmark_cross_token_softmax_buffered(
+    batch_size: int,
+    num_heads_q: int,
+    num_heads_k: int,
+    seq_len_q: int,
+    seq_len_k: int,
+    head_dim: int,
+    split: int,
+    causal: bool = False,
+    dropout_p: float = 0.0,
+    dtype: torch.dtype = torch.float16,
+    warmup_ms: int = 50,
+    rep_ms: int = 200,
+    num_runs: int = 3,
+    device: str = "cuda",
+) -> Dict[str, float]:
+    """
+    Benchmark attention_cross_token_softmax_sum_buffered implementation (with QK^T buffering)
+    """
+    if device != "cuda":
+        raise ValueError("do_bench only supports CUDA devices")
+
+    try:
+        q = torch.randn(batch_size, num_heads_q, seq_len_q, head_dim, dtype=dtype, device=device)
+        k = torch.randn(batch_size, num_heads_k, seq_len_k, head_dim, dtype=dtype, device=device)
+        v = torch.randn(batch_size, num_heads_k, seq_len_k, head_dim, dtype=dtype, device=device)
+
+        q = q.contiguous()
+        k = k.contiguous()
+        v = v.contiguous()
+
+        def fn():
+            return attention_cross_token_softmax_sum_buffered(q, k, v, split=split, causal=causal, dropout_p=dropout_p)
+
+        all_run_times = []
+        total_runs_to_perform = num_runs + 2
+
+        for run_idx in range(total_runs_to_perform):
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+
+            # JIT compilation warmup
+            for _ in range(5):
+                _ = fn()
+            torch.cuda.synchronize()
+
+            run_ms = do_bench(fn, warmup=warmup_ms, rep=rep_ms)
+            if run_ms != float("inf") and run_ms > 0:
+                all_run_times.append(run_ms)
+
+        if len(all_run_times) >= num_runs:
+            # Use last num_runs results for statistics
+            run_times = sorted(all_run_times[-num_runs:])
+        else:
+            run_times = sorted(all_run_times) if all_run_times else [float("inf")]
+
+        median_time_ms = run_times[len(run_times) // 2] if run_times else float("inf")
+        avg_time_ms = sum(run_times) / len(run_times) if run_times else float("inf")
+        min_time_ms = run_times[0] if run_times else float("inf")
+        max_time_ms = run_times[-1] if run_times else float("inf")
+
+        total_tokens = batch_size * num_heads_q * seq_len_q
+        throughput = total_tokens / (median_time_ms / 1000) if median_time_ms != float("inf") else 0.0
+
+        # Calculate TFLOPs (only matmul operations)
+        flops = 4 * batch_size * num_heads_q * seq_len_q * seq_len_k * head_dim
+        tflops = (flops / (median_time_ms / 1000)) / 1e12 if median_time_ms != float("inf") else 0.0
+
+        return {
+            "avg_time_ms": avg_time_ms,
+            "median_time_ms": median_time_ms,
+            "min_time_ms": min_time_ms,
+            "max_time_ms": max_time_ms,
+            "throughput_tokens_per_sec": throughput,
+            "tflops": tflops,
+        }
+
+    except torch.cuda.OutOfMemoryError:
+        return {
+            "avg_time_ms": float("inf"),
+            "median_time_ms": float("inf"),
+            "min_time_ms": float("inf"),
+            "max_time_ms": float("inf"),
+            "throughput_tokens_per_sec": 0.0,
+            "tflops": 0.0,
+        }
+    except Exception as e:
+        print(f"Error in benchmark_cross_token_softmax_buffered: {e}")
+        return {
+            "avg_time_ms": float("inf"),
+            "median_time_ms": float("inf"),
+            "min_time_ms": float("inf"),
+            "max_time_ms": float("inf"),
+            "throughput_tokens_per_sec": 0.0,
+            "tflops": 0.0,
+        }
+
+
+def benchmark_cross_token_qk(
     batch_size: int,
     num_heads_q: int,
     num_heads_k: int,
@@ -715,7 +914,7 @@ def benchmark_split_qk_sum(
     device: str = "cuda",
 ) -> Dict[str, float]:
     """
-    Benchmark attention_split_qk_sum implementation
+    Benchmark attention_cross_token_qk_sum implementation
     """
     if device != "cuda":
         raise ValueError("do_bench only supports CUDA devices")
@@ -730,7 +929,7 @@ def benchmark_split_qk_sum(
         v = v.contiguous()
         
         def fn():
-            return attention_split_qk_sum(q, k, v, split=split, causal=causal, dropout_p=dropout_p)
+            return attention_cross_token_qk_sum(q, k, v, split=split, causal=causal, dropout_p=dropout_p)
         
         all_run_times = []
         total_runs_to_perform = num_runs + 2
@@ -906,7 +1105,7 @@ def verify_correctness(
         output_flash, scores_flash = attention_with_scores(q_flash, k_flash, v_flash, causal=causal)
         results['flash_with_scores'] = {'output': output_flash, 'scores': scores_flash}
     except Exception as e:
-        print(f"    ✗ Flash Attention + Scores failed: {e}")
+        print(f"    ✗ + Scores failed: {e}")
     
     # 3. Flash Attention with Row Sum
     try:
@@ -917,7 +1116,7 @@ def verify_correctness(
         output_row, row_sum = attention_with_row_sum(q_row, k_row, v_row, causal=causal)
         results['flash_row_sum'] = {'output': output_row, 'row_sum': row_sum}
     except Exception as e:
-        print(f"    ✗ Flash Attention + Row Sum failed: {e}")
+        print(f"    ✗ + Row Sum failed: {e}")
     
     # 4. Flash Attention with Col Sum
     try:
@@ -928,7 +1127,7 @@ def verify_correctness(
         output_col, col_sum = attention_with_col_sum(q_col, k_col, v_col, causal=causal)
         results['flash_col_sum'] = {'output': output_col, 'col_sum': col_sum}
     except Exception as e:
-        print(f"    ✗ Flash Attention + Col Sum failed: {e}")
+        print(f"    ✗ + Col Sum failed: {e}")
     
     # 5. Flash Attention with Col Sum Sequential
     try:
@@ -939,19 +1138,41 @@ def verify_correctness(
         output_col_seq, col_sum_seq = attention_with_col_sum_sequential(q_col_seq, k_col_seq, v_col_seq, causal=causal)
         results['flash_col_sum_sequential'] = {'output': output_col_seq, 'col_sum': col_sum_seq}
     except Exception as e:
-        print(f"    ✗ Flash Attention + Col Sum Sequential failed: {e}")
+        print(f"    ✗ + Col Sum Sequential failed: {e}")
     
-    # 6. Flash Attention with Split QK Sum
+    # 6. Flash Attention with Col Sum Softmax
+    try:
+        torch.manual_seed(42)
+        q_col_softmax = q.clone()
+        k_col_softmax = k.clone()
+        v_col_softmax = v.clone()
+        output_col_softmax, cross_token_softmax = attention_cross_token_softmax_sum(q_col_softmax, k_col_softmax, v_col_softmax, split=split, causal=causal)
+        results['flash_cross_token_softmax'] = {'output': output_col_softmax, 'cross_token_softmax': cross_token_softmax}
+    except Exception as e:
+        print(f"    ✗ + Cross-Token Softmax Sum failed: {e}")
+
+    # 6b. Flash Attention with Col Sum Softmax (Buffered)
+    try:
+        torch.manual_seed(42)
+        q_col_softmax_buf = q.clone()
+        k_col_softmax_buf = k.clone()
+        v_col_softmax_buf = v.clone()
+        output_col_softmax_buf, cross_token_softmax_buf = attention_cross_token_softmax_sum_buffered(q_col_softmax_buf, k_col_softmax_buf, v_col_softmax_buf, split=split, causal=causal)
+        results['flash_cross_token_softmax_buffered'] = {'output': output_col_softmax_buf, 'cross_token_softmax': cross_token_softmax_buf}
+    except Exception as e:
+        print(f"    ✗ + Cross-Token Softmax Sum (Buffered) failed: {e}")
+
+    # 7. Flash Attention with Split QK Sum
     try:
         if split < seq_len_k and split < seq_len_q:
             torch.manual_seed(42)
             q_split = q.clone()
             k_split = k.clone()
             v_split = v.clone()
-            output_split, split_qk_sum = attention_split_qk_sum(q_split, k_split, v_split, split=split, causal=causal)
-            results['flash_split_qk_sum'] = {'output': output_split, 'split_qk_sum': split_qk_sum}
+            output_split, cross_token_qk = attention_cross_token_qk_sum(q_split, k_split, v_split, split=split, causal=causal)
+            results['flash_cross_token_qk'] = {'output': output_split, 'cross_token_qk': cross_token_qk}
     except Exception as e:
-        print(f"    ✗ Flash Attention + Split QK Sum failed: {e}")
+        print(f"    ✗ + Cross-Token QK Sum failed: {e}")
     
     # Calculate errors for each implementation
     reference_output = results['naive']['output']
@@ -1182,51 +1403,116 @@ def verify_correctness(
                 'col_sum_mean_rel_error': col_sum_mean_rel_error,
             })
         
-        # Calculate split_qk_sum errors if available
-        if 'split_qk_sum' in impl_result:
-            impl_split_qk_sum = impl_result['split_qk_sum']
+        # Calculate cross_token_softmax errors if available
+        if 'cross_token_softmax' in impl_result:
+            impl_cross_token_softmax = impl_result['cross_token_softmax']
+            # Reference: compute softmax attention weights and sum over queries
+            reference_scores_for_cross_token_softmax = reference_scores.clone()
+            # Apply softmax to reference scores
+            # Handle causal mask: replace -inf with a large negative value before softmax
+            # Use a value that's safe for float16: -65504 is the min for fp16, use -6e4 to be safe
+            dtype = reference_scores_for_cross_token_softmax.dtype
+            if dtype == torch.float16:
+                mask_value = -6e4  # Safe for float16 (min is ~-65504)
+            else:
+                mask_value = -1e10  # Safe for float32/float64
+
+            reference_scores_for_cross_token_softmax = torch.where(
+                torch.isinf(reference_scores_for_cross_token_softmax) & (reference_scores_for_cross_token_softmax < 0),
+                torch.full_like(reference_scores_for_cross_token_softmax, mask_value),
+                reference_scores_for_cross_token_softmax
+            )
+            # Compute softmax along the last dimension (over keys for each query)
+            reference_attention_weights = torch.softmax(reference_scores_for_cross_token_softmax, dim=-1)
+
+            # Apply split logic: only queries >= split contribute to keys < split
+            # reference_attention_weights shape: (B, H, M, N)
+            # We want: sum over queries[split:] for keys[:split]
+            reference_attention_weights_split = reference_attention_weights[:, :, split:, :split]
+            # Sum over queries dimension (dim=-2) to get column-wise sum
+            reference_cross_token_softmax = reference_attention_weights_split.sum(dim=-2)
+
+            cross_token_softmax_diff = (impl_cross_token_softmax - reference_cross_token_softmax).abs()
+            # Filter out inf and nan (use safe method for large tensors)
+            valid_mask = _safe_isfinite_mask(cross_token_softmax_diff) & _safe_isfinite_mask(reference_cross_token_softmax)
+            count = valid_mask.sum().item()
+            if count > 0:
+                cross_token_softmax_abs_error, cross_token_softmax_mean_abs_error, _ = _safe_finite_stats(cross_token_softmax_diff, valid_mask)
+                
+                # Calculate relative error (only for non-zero reference values)
+                ref_cross_token_softmax_abs = reference_cross_token_softmax.abs()
+                ref_cross_token_softmax_abs_safe = torch.clamp(ref_cross_token_softmax_abs, min=1e-6)
+                rel_error_tensor = cross_token_softmax_diff / ref_cross_token_softmax_abs_safe
+                # Replace any inf/nan values that might have been created before clamp
+                rel_error_tensor = torch.where(torch.isfinite(rel_error_tensor), rel_error_tensor, torch.tensor(1e10, device=rel_error_tensor.device, dtype=rel_error_tensor.dtype))
+                # Clamp relative error to avoid inf (max relative error = 1e10)
+                rel_error_tensor = torch.clamp(rel_error_tensor, max=1e10)
+                rel_error_mask = valid_mask & (ref_cross_token_softmax_abs > 1e-6) & _safe_isfinite_mask(rel_error_tensor)
+                rel_error_count = rel_error_mask.sum().item()
+                
+                if rel_error_count > 0:
+                    cross_token_softmax_rel_error, cross_token_softmax_mean_rel_error, _ = _safe_finite_stats(rel_error_tensor, rel_error_mask)
+                else:
+                    cross_token_softmax_rel_error = min(cross_token_softmax_abs_error, 1e10)
+                    cross_token_softmax_mean_rel_error = min(cross_token_softmax_mean_abs_error, 1e10)
+            else:
+                cross_token_softmax_abs_error = float('inf')
+                cross_token_softmax_mean_abs_error = float('inf')
+                cross_token_softmax_rel_error = 1e10  # Clamp to max relative error
+                cross_token_softmax_mean_rel_error = 1e10
+            
+            errors[impl_name].update({
+                'cross_token_softmax_max_abs_error': cross_token_softmax_abs_error,
+                'cross_token_softmax_mean_abs_error': cross_token_softmax_mean_abs_error,
+                'cross_token_softmax_max_rel_error': cross_token_softmax_rel_error,
+                'cross_token_softmax_mean_rel_error': cross_token_softmax_mean_rel_error,
+            })
+        
+        # Calculate cross_token_qk errors if available
+        if 'cross_token_qk' in impl_result:
+            impl_cross_token_qk = impl_result['cross_token_qk']
             reference_scores_for_split = reference_scores.clone()
             reference_scores_for_split = torch.where(
                 torch.isinf(reference_scores_for_split) & (reference_scores_for_split < 0),
                 torch.zeros_like(reference_scores_for_split),
                 reference_scores_for_split
             )
-            reference_split_qk_sum = reference_scores_for_split[:, :, split:, :split].sum(dim=-2)
+            reference_cross_token_qk = reference_scores_for_split[:, :, split:, :split].sum(dim=-2)
             
-            split_qk_sum_diff = (impl_split_qk_sum - reference_split_qk_sum).abs()
+            cross_token_qk_diff = (impl_cross_token_qk - reference_cross_token_qk).abs()
             # Filter out inf and nan (use safe method for large tensors)
-            valid_mask = _safe_isfinite_mask(split_qk_sum_diff) & _safe_isfinite_mask(reference_split_qk_sum)
+            valid_mask = _safe_isfinite_mask(cross_token_qk_diff) & _safe_isfinite_mask(reference_cross_token_qk)
             count = valid_mask.sum().item()
             if count > 0:
-                split_qk_sum_abs_error, split_qk_sum_mean_abs_error, _ = _safe_finite_stats(split_qk_sum_diff, valid_mask)
+                cross_token_qk_abs_error, cross_token_qk_mean_abs_error, _ = _safe_finite_stats(cross_token_qk_diff, valid_mask)
                 
                 # Calculate relative error (only for non-zero reference values)
-                ref_split_qk_sum_abs = reference_split_qk_sum.abs()
-                ref_split_qk_sum_abs_safe = torch.clamp(ref_split_qk_sum_abs, min=1e-6)
-                rel_error_tensor = split_qk_sum_diff / ref_split_qk_sum_abs_safe
+                ref_cross_token_qk_abs = reference_cross_token_qk.abs()
+                ref_cross_token_qk_abs_safe = torch.clamp(ref_cross_token_qk_abs, min=1e-6)
+                rel_error_tensor = cross_token_qk_diff / ref_cross_token_qk_abs_safe
                 # Replace any inf/nan values that might have been created before clamp
                 rel_error_tensor = torch.where(torch.isfinite(rel_error_tensor), rel_error_tensor, torch.tensor(1e10, device=rel_error_tensor.device, dtype=rel_error_tensor.dtype))
                 # Clamp relative error to avoid inf (max relative error = 1e10)
                 rel_error_tensor = torch.clamp(rel_error_tensor, max=1e10)
-                rel_error_mask = valid_mask & (ref_split_qk_sum_abs > 1e-6) & _safe_isfinite_mask(rel_error_tensor)
+                rel_error_mask = valid_mask & (ref_cross_token_qk_abs > 1e-6) & _safe_isfinite_mask(rel_error_tensor)
                 rel_error_count = rel_error_mask.sum().item()
                 
                 if rel_error_count > 0:
-                    split_qk_sum_rel_error, split_qk_sum_mean_rel_error, _ = _safe_finite_stats(rel_error_tensor, rel_error_mask)
+                    cross_token_qk_rel_error, cross_token_qk_mean_rel_error, _ = _safe_finite_stats(rel_error_tensor, rel_error_mask)
                 else:
-                    split_qk_sum_rel_error = min(split_qk_sum_abs_error, 1e10)
-                    split_qk_sum_mean_rel_error = min(split_qk_sum_mean_abs_error, 1e10)
+                    cross_token_qk_rel_error = min(cross_token_qk_abs_error, 1e10)
+                    cross_token_qk_mean_rel_error = min(cross_token_qk_mean_abs_error, 1e10)
             else:
-                split_qk_sum_abs_error = float('inf')
-                split_qk_sum_mean_abs_error = float('inf')
-                split_qk_sum_rel_error = 1e10  # Clamp to max relative error
-                split_qk_sum_mean_rel_error = 1e10
+                cross_token_qk_abs_error = float('inf')
+                cross_token_qk_mean_abs_error = float('inf')
+                cross_token_qk_rel_error = 1e10  # Clamp to max relative error
+                cross_token_qk_mean_rel_error = 1e10
             
             errors[impl_name].update({
-                'split_qk_sum_max_abs_error': split_qk_sum_abs_error,
-                'split_qk_sum_mean_abs_error': split_qk_sum_mean_abs_error,
-                'split_qk_sum_max_rel_error': split_qk_sum_rel_error,
-                'split_qk_sum_mean_rel_error': split_qk_sum_mean_rel_error,
+                'cross_token_qk_max_abs_error': cross_token_qk_abs_error,
+                'cross_token_qk_mean_abs_error': cross_token_qk_mean_abs_error,
+                'cross_token_qk_max_rel_error': cross_token_qk_rel_error,
+                'cross_token_qk_mean_rel_error': cross_token_qk_mean_rel_error,
             })
     
     # Print error summary in a formatted table
@@ -1235,11 +1521,13 @@ def verify_correctness(
     
     for impl_name, error_metrics in errors.items():
         impl_display_name = {
-            'flash_with_scores': 'Flash Attention + Scores',
-            'flash_row_sum': 'Flash Attention + Row Sum',
-            'flash_col_sum': 'Flash Attention + Col Sum',
-            'flash_col_sum_sequential': 'Flash Attention + Col Sum (Sequential)',
-            'flash_split_qk_sum': 'Flash Attention + Split QK Sum',
+            'flash_with_scores': '+ Scores',
+            'flash_row_sum': '+ Row Sum',
+            'flash_col_sum': '+ Col Sum',
+            'flash_col_sum_sequential': '+ Col Sum (Sequential)',
+            'flash_cross_token_softmax': '+ Cross-Token Softmax Sum',
+            'flash_cross_token_softmax_buffered': '+ Cross-Token Softmax Sum (Buffered)',
+            'flash_cross_token_qk': '+ Cross-Token QK Sum',
         }.get(impl_name, impl_name)
         
         print(f"    {impl_display_name}:")
@@ -1347,31 +1635,57 @@ def verify_correctness(
             print(f"        Max Absolute Error: {col_sum_abs_str_max}  |  Mean Absolute Error: {col_sum_abs_str_mean}")
             print(f"        Max Relative Error: {col_sum_rel_str_max}  |  Mean Relative Error: {col_sum_rel_str_mean}")
         
-        if 'split_qk_sum_max_abs_error' in error_metrics:
-            print(f"      Split QK Sum:")
-            split_qk_sum_max_abs = error_metrics['split_qk_sum_max_abs_error']
-            split_qk_sum_mean_abs = error_metrics['split_qk_sum_mean_abs_error']
-            split_qk_sum_max_rel = error_metrics['split_qk_sum_max_rel_error']
-            split_qk_sum_mean_rel = error_metrics['split_qk_sum_mean_rel_error']
+        if 'cross_token_softmax_max_abs_error' in error_metrics:
+            print(f"      Cross-Token Softmax Sum:")
+            cross_token_softmax_max_abs = error_metrics['cross_token_softmax_max_abs_error']
+            cross_token_softmax_mean_abs = error_metrics['cross_token_softmax_mean_abs_error']
+            cross_token_softmax_max_rel = error_metrics['cross_token_softmax_max_rel_error']
+            cross_token_softmax_mean_rel = error_metrics['cross_token_softmax_mean_rel_error']
             
-            split_qk_sum_abs_str_max = f"{split_qk_sum_max_abs:.6e}" if torch.isfinite(torch.tensor(split_qk_sum_max_abs)) else "inf"
-            split_qk_sum_abs_str_mean = f"{split_qk_sum_mean_abs:.6e}" if torch.isfinite(torch.tensor(split_qk_sum_mean_abs)) else "inf"
+            cross_token_softmax_abs_str_max = f"{cross_token_softmax_max_abs:.6e}" if torch.isfinite(torch.tensor(cross_token_softmax_max_abs)) else "inf"
+            cross_token_softmax_abs_str_mean = f"{cross_token_softmax_mean_abs:.6e}" if torch.isfinite(torch.tensor(cross_token_softmax_mean_abs)) else "inf"
             # Format relative error, showing ">1e10" if clamped
-            if not torch.isfinite(torch.tensor(split_qk_sum_max_rel)):
-                split_qk_sum_rel_str_max = "inf"
-            elif split_qk_sum_max_rel >= 1e10:
-                split_qk_sum_rel_str_max = ">1e10"
+            if not torch.isfinite(torch.tensor(cross_token_softmax_max_rel)):
+                cross_token_softmax_rel_str_max = "inf"
+            elif cross_token_softmax_max_rel >= 1e10:
+                cross_token_softmax_rel_str_max = ">1e10"
             else:
-                split_qk_sum_rel_str_max = f"{split_qk_sum_max_rel:.6e}"
-            if not torch.isfinite(torch.tensor(split_qk_sum_mean_rel)):
-                split_qk_sum_rel_str_mean = "inf"
-            elif split_qk_sum_mean_rel >= 1e10:
-                split_qk_sum_rel_str_mean = ">1e10"
+                cross_token_softmax_rel_str_max = f"{cross_token_softmax_max_rel:.6e}"
+            if not torch.isfinite(torch.tensor(cross_token_softmax_mean_rel)):
+                cross_token_softmax_rel_str_mean = "inf"
+            elif cross_token_softmax_mean_rel >= 1e10:
+                cross_token_softmax_rel_str_mean = ">1e10"
             else:
-                split_qk_sum_rel_str_mean = f"{split_qk_sum_mean_rel:.6e}"
+                cross_token_softmax_rel_str_mean = f"{cross_token_softmax_mean_rel:.6e}"
             
-            print(f"        Max Absolute Error: {split_qk_sum_abs_str_max}  |  Mean Absolute Error: {split_qk_sum_abs_str_mean}")
-            print(f"        Max Relative Error: {split_qk_sum_rel_str_max}  |  Mean Relative Error: {split_qk_sum_rel_str_mean}")
+            print(f"        Max Absolute Error: {cross_token_softmax_abs_str_max}  |  Mean Absolute Error: {cross_token_softmax_abs_str_mean}")
+            print(f"        Max Relative Error: {cross_token_softmax_rel_str_max}  |  Mean Relative Error: {cross_token_softmax_rel_str_mean}")
+        
+        if 'cross_token_qk_max_abs_error' in error_metrics:
+            print(f"      Cross-Token QK Sum:")
+            cross_token_qk_max_abs = error_metrics['cross_token_qk_max_abs_error']
+            cross_token_qk_mean_abs = error_metrics['cross_token_qk_mean_abs_error']
+            cross_token_qk_max_rel = error_metrics['cross_token_qk_max_rel_error']
+            cross_token_qk_mean_rel = error_metrics['cross_token_qk_mean_rel_error']
+            
+            cross_token_qk_abs_str_max = f"{cross_token_qk_max_abs:.6e}" if torch.isfinite(torch.tensor(cross_token_qk_max_abs)) else "inf"
+            cross_token_qk_abs_str_mean = f"{cross_token_qk_mean_abs:.6e}" if torch.isfinite(torch.tensor(cross_token_qk_mean_abs)) else "inf"
+            # Format relative error, showing ">1e10" if clamped
+            if not torch.isfinite(torch.tensor(cross_token_qk_max_rel)):
+                cross_token_qk_rel_str_max = "inf"
+            elif cross_token_qk_max_rel >= 1e10:
+                cross_token_qk_rel_str_max = ">1e10"
+            else:
+                cross_token_qk_rel_str_max = f"{cross_token_qk_max_rel:.6e}"
+            if not torch.isfinite(torch.tensor(cross_token_qk_mean_rel)):
+                cross_token_qk_rel_str_mean = "inf"
+            elif cross_token_qk_mean_rel >= 1e10:
+                cross_token_qk_rel_str_mean = ">1e10"
+            else:
+                cross_token_qk_rel_str_mean = f"{cross_token_qk_mean_rel:.6e}"
+            
+            print(f"        Max Absolute Error: {cross_token_qk_abs_str_max}  |  Mean Absolute Error: {cross_token_qk_abs_str_mean}")
+            print(f"        Max Relative Error: {cross_token_qk_rel_str_max}  |  Mean Relative Error: {cross_token_qk_rel_str_mean}")
         
         print()
     
@@ -1480,7 +1794,7 @@ def run_benchmark_suite(
             )
             
             # Test Flash Attention
-            print("  [Flash Attention + Scores]")
+            print("  [+ Scores]")
             flash_result = benchmark_attention_with_scores(
                 batch_size=config['batch_size'],
                 num_heads_q=config['num_heads_q'],
@@ -1527,7 +1841,10 @@ def run_benchmark_suite(
             
             # Benchmark row_sum and col_sum if requested
             if include_sum_ops:
-                print("  [Flash Attention + Row Sum]")
+                # Compute split value for benchmarks that need it
+                split = config.get('split', 768)
+
+                print("  [+ Row Sum]")
                 row_sum_result = benchmark_row_sum(
                     batch_size=config['batch_size'],
                     num_heads_q=config['num_heads_q'],
@@ -1543,7 +1860,7 @@ def run_benchmark_suite(
                     device=device,
                 )
                 
-                print("  [Flash Attention + Col Sum (Reverse-Order)]")
+                print("  [+ Col Sum (Reverse-Order)]")
                 col_sum_result = benchmark_col_sum(
                     batch_size=config['batch_size'],
                     num_heads_q=config['num_heads_q'],
@@ -1559,7 +1876,7 @@ def run_benchmark_suite(
                     device=device,
                 )
                 
-                print("  [Flash Attention + Col Sum (Sequential)]")
+                print("  [+ Col Sum (Sequential)]")
                 col_sum_sequential_result = benchmark_col_sum_sequential(
                     batch_size=config['batch_size'],
                     num_heads_q=config['num_heads_q'],
@@ -1575,11 +1892,44 @@ def run_benchmark_suite(
                     device=device,
                 )
                 
-                # Benchmark split_qk_sum if split is specified and valid
-                split = config.get('split', 768)
+                print("  [+ Cross-Token Softmax Sum]")
+                cross_token_softmax_result = benchmark_cross_token_softmax(
+                    batch_size=config['batch_size'],
+                    num_heads_q=config['num_heads_q'],
+                    num_heads_k=config['num_heads_k'],
+                    seq_len_q=config['seq_len_q'],
+                    seq_len_k=config['seq_len_k'],
+                    head_dim=config['head_dim'],
+                    split=split,
+                    causal=causal,
+                    dtype=dtype,
+                    warmup_ms=warmup_ms,
+                    rep_ms=rep_ms,
+                    num_runs=num_runs,
+                    device=device,
+                )
+
+                print("  [+ Cross-Token Softmax Sum (Buffered)]")
+                cross_token_softmax_buffered_result = benchmark_cross_token_softmax_buffered(
+                    batch_size=config['batch_size'],
+                    num_heads_q=config['num_heads_q'],
+                    num_heads_k=config['num_heads_k'],
+                    seq_len_q=config['seq_len_q'],
+                    seq_len_k=config['seq_len_k'],
+                    head_dim=config['head_dim'],
+                    split=split,
+                    causal=causal,
+                    dtype=dtype,
+                    warmup_ms=warmup_ms,
+                    rep_ms=rep_ms,
+                    num_runs=num_runs,
+                    device=device,
+                )
+
+                # Benchmark cross_token_qk if split is specified and valid
                 if split < config['seq_len_k'] and split < config['seq_len_q']:
-                    print(f"  [Flash Attention + Split QK Sum (split={split})]")
-                    split_qk_sum_result = benchmark_split_qk_sum(
+                    print(f"  [+ Cross-Token QK Sum (split={split})]")
+                    cross_token_qk_result = benchmark_cross_token_qk(
                         batch_size=config['batch_size'],
                         num_heads_q=config['num_heads_q'],
                         num_heads_k=config['num_heads_k'],
@@ -1595,8 +1945,8 @@ def run_benchmark_suite(
                         device=device,
                     )
                 else:
-                    print(f"  [Flash Attention + Split QK Sum (split={split})] - Skipped (split >= seq_len)")
-                    split_qk_sum_result = {
+                    print(f"  [+ Cross-Token QK Sum (split={split})] - Skipped (split >= seq_len)")
+                    cross_token_qk_result = {
                         "avg_time_ms": float("inf"),
                         "median_time_ms": float("inf"),
                         "min_time_ms": float("inf"),
@@ -1610,21 +1960,29 @@ def run_benchmark_suite(
                 row_sum_speedup = naive_time / row_sum_result["median_time_ms"] if naive_time != float("inf") and row_sum_result["median_time_ms"] != float("inf") else 0.0
                 col_sum_speedup = naive_time / col_sum_result["median_time_ms"] if naive_time != float("inf") and col_sum_result["median_time_ms"] != float("inf") else 0.0
                 col_sum_sequential_speedup = naive_time / col_sum_sequential_result["median_time_ms"] if naive_time != float("inf") and col_sum_sequential_result["median_time_ms"] != float("inf") else 0.0
-                split_qk_sum_speedup = naive_time / split_qk_sum_result["median_time_ms"] if naive_time != float("inf") and split_qk_sum_result["median_time_ms"] != float("inf") else 0.0
+                cross_token_softmax_speedup = naive_time / cross_token_softmax_result["median_time_ms"] if naive_time != float("inf") and cross_token_softmax_result["median_time_ms"] != float("inf") else 0.0
+                cross_token_softmax_buffered_speedup = naive_time / cross_token_softmax_buffered_result["median_time_ms"] if naive_time != float("inf") and cross_token_softmax_buffered_result["median_time_ms"] != float("inf") else 0.0
+                cross_token_qk_speedup = naive_time / cross_token_qk_result["median_time_ms"] if naive_time != float("inf") and cross_token_qk_result["median_time_ms"] != float("inf") else 0.0
                 
                 print(f"    Row Sum: {row_sum_result['median_time_ms']:.3f}ms ({row_sum_speedup:.2f} vs Naive), "
-                      f"Col Sum (Reverse): {col_sum_result['median_time_ms']:.3f}ms ({col_sum_speedup:.2f} vs Naive), "
-                      f"Col Sum (Sequential): {col_sum_sequential_result['median_time_ms']:.3f}ms ({col_sum_sequential_speedup:.2f} vs Naive), "
-                      f"Split QK Sum: {split_qk_sum_result['median_time_ms']:.3f}ms ({split_qk_sum_speedup:.2f} vs Naive)")
+                      f"Col Sum (Reverse): {col_sum_result['median_time_ms']:.3f}ms ({col_sum_speedup:.2f} vs Naive)")
+                print(f"    Col Sum (Sequential): {col_sum_sequential_result['median_time_ms']:.3f}ms ({col_sum_sequential_speedup:.2f} vs Naive), "
+                      f"Cross-Token Softmax: {cross_token_softmax_result['median_time_ms']:.3f}ms ({cross_token_softmax_speedup:.2f} vs Naive)")
+                print(f"    Cross-Token Softmax (Buffered): {cross_token_softmax_buffered_result['median_time_ms']:.3f}ms ({cross_token_softmax_buffered_speedup:.2f} vs Naive), "
+                      f"Cross-Token QK: {cross_token_qk_result['median_time_ms']:.3f}ms ({cross_token_qk_speedup:.2f} vs Naive)")
                 
                 results[-1]["row_sum"] = row_sum_result
                 results[-1]["col_sum"] = col_sum_result
                 results[-1]["col_sum_sequential"] = col_sum_sequential_result
-                results[-1]["split_qk_sum"] = split_qk_sum_result
+                results[-1]["cross_token_softmax"] = cross_token_softmax_result
+                results[-1]["cross_token_softmax_buffered"] = cross_token_softmax_buffered_result
+                results[-1]["cross_token_qk"] = cross_token_qk_result
                 results[-1]["row_sum_speedup"] = row_sum_speedup
                 results[-1]["col_sum_speedup"] = col_sum_speedup
                 results[-1]["col_sum_sequential_speedup"] = col_sum_sequential_speedup
-                results[-1]["split_qk_sum_speedup"] = split_qk_sum_speedup
+                results[-1]["cross_token_softmax_speedup"] = cross_token_softmax_speedup
+                results[-1]["cross_token_softmax_buffered_speedup"] = cross_token_softmax_buffered_speedup
+                results[-1]["cross_token_qk_speedup"] = cross_token_qk_speedup
             
         except Exception as e:
             print(f"  ✗ Test failed: {e}")
@@ -1644,11 +2002,13 @@ def run_benchmark_suite(
         method_names = [
             "Naive (PyTorch)",
             "PyTorch SDPA",
-            "Flash Attention + Scores",
-            "Flash Attention + Row Sum",
-            "Flash Attention + Col Sum (Reverse)",
-            "Flash Attention + Col Sum (Sequential)",
-            "Flash Attention + Split QK Sum"
+            "+ Scores",
+            "+ Row Sum",
+            "+ Col Sum (Reverse)",
+            "+ Col Sum (Sequential)",
+            "+ Cross-Token Softmax Sum",
+            "+ Cross-Token Softmax Sum (Buffered)",
+            "+ Cross-Token QK Sum"
         ]
         
         # Initialize data structure
@@ -1675,31 +2035,41 @@ def run_benchmark_suite(
             method_data["PyTorch SDPA"]["times"].append((config_label, pytorch_time))
             method_data["PyTorch SDPA"]["speedups"].append((config_label, pytorch_speedup))
             
-            method_data["Flash Attention + Scores"]["times"].append((config_label, flash_time))
-            method_data["Flash Attention + Scores"]["speedups"].append((config_label, flash_speedup))
+            method_data["+ Scores"]["times"].append((config_label, flash_time))
+            method_data["+ Scores"]["speedups"].append((config_label, flash_speedup))
             
             # Always collect row_sum and col_sum data, even if missing (will show N/A)
             row_sum_time = result.get("row_sum", {}).get("median_time_ms", float("inf"))
             col_sum_time = result.get("col_sum", {}).get("median_time_ms", float("inf"))
             col_sum_sequential_time = result.get("col_sum_sequential", {}).get("median_time_ms", float("inf"))
-            split_qk_sum_time = result.get("split_qk_sum", {}).get("median_time_ms", float("inf"))
-            
+            cross_token_softmax_time = result.get("cross_token_softmax", {}).get("median_time_ms", float("inf"))
+            cross_token_softmax_buffered_time = result.get("cross_token_softmax_buffered", {}).get("median_time_ms", float("inf"))
+            cross_token_qk_time = result.get("cross_token_qk", {}).get("median_time_ms", float("inf"))
+
             row_sum_speedup = result.get("row_sum_speedup", 0.0)
             col_sum_speedup = result.get("col_sum_speedup", 0.0)
             col_sum_sequential_speedup = result.get("col_sum_sequential_speedup", 0.0)
-            split_qk_sum_speedup = result.get("split_qk_sum_speedup", 0.0)
+            cross_token_softmax_speedup = result.get("cross_token_softmax_speedup", 0.0)
+            cross_token_softmax_buffered_speedup = result.get("cross_token_softmax_buffered_speedup", 0.0)
+            cross_token_qk_speedup = result.get("cross_token_qk_speedup", 0.0)
             
-            method_data["Flash Attention + Row Sum"]["times"].append((config_label, row_sum_time))
-            method_data["Flash Attention + Row Sum"]["speedups"].append((config_label, row_sum_speedup))
+            method_data["+ Row Sum"]["times"].append((config_label, row_sum_time))
+            method_data["+ Row Sum"]["speedups"].append((config_label, row_sum_speedup))
             
-            method_data["Flash Attention + Col Sum (Reverse)"]["times"].append((config_label, col_sum_time))
-            method_data["Flash Attention + Col Sum (Reverse)"]["speedups"].append((config_label, col_sum_speedup))
+            method_data["+ Col Sum (Reverse)"]["times"].append((config_label, col_sum_time))
+            method_data["+ Col Sum (Reverse)"]["speedups"].append((config_label, col_sum_speedup))
             
-            method_data["Flash Attention + Col Sum (Sequential)"]["times"].append((config_label, col_sum_sequential_time))
-            method_data["Flash Attention + Col Sum (Sequential)"]["speedups"].append((config_label, col_sum_sequential_speedup))
+            method_data["+ Col Sum (Sequential)"]["times"].append((config_label, col_sum_sequential_time))
+            method_data["+ Col Sum (Sequential)"]["speedups"].append((config_label, col_sum_sequential_speedup))
             
-            method_data["Flash Attention + Split QK Sum"]["times"].append((config_label, split_qk_sum_time))
-            method_data["Flash Attention + Split QK Sum"]["speedups"].append((config_label, split_qk_sum_speedup))
+            method_data["+ Cross-Token Softmax Sum"]["times"].append((config_label, cross_token_softmax_time))
+            method_data["+ Cross-Token Softmax Sum"]["speedups"].append((config_label, cross_token_softmax_speedup))
+
+            method_data["+ Cross-Token Softmax Sum (Buffered)"]["times"].append((config_label, cross_token_softmax_buffered_time))
+            method_data["+ Cross-Token Softmax Sum (Buffered)"]["speedups"].append((config_label, cross_token_softmax_buffered_speedup))
+
+            method_data["+ Cross-Token QK Sum"]["times"].append((config_label, cross_token_qk_time))
+            method_data["+ Cross-Token QK Sum"]["speedups"].append((config_label, cross_token_qk_speedup))
         
         # Print header
         config_labels = [label for label, _ in method_data["Naive (PyTorch)"]["times"]]
@@ -1734,7 +2104,7 @@ def run_benchmark_suite(
         method_names = [
             "Naive (PyTorch)",
             "PyTorch SDPA",
-            "Flash Attention + Scores"
+            "+ Scores"
         ]
         
         # Initialize data structure
@@ -1761,8 +2131,8 @@ def run_benchmark_suite(
             method_data["PyTorch SDPA"]["times"].append((config_label, pytorch_time))
             method_data["PyTorch SDPA"]["speedups"].append((config_label, pytorch_speedup))
             
-            method_data["Flash Attention + Scores"]["times"].append((config_label, flash_time))
-            method_data["Flash Attention + Scores"]["speedups"].append((config_label, flash_speedup))
+            method_data["+ Scores"]["times"].append((config_label, flash_time))
+            method_data["+ Scores"]["speedups"].append((config_label, flash_speedup))
         
         # Print header
         config_labels = [label for label, _ in method_data["Naive (PyTorch)"]["times"]]
