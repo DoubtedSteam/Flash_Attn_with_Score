@@ -116,22 +116,21 @@ The benchmark supports automatic configuration search to find optimal kernel par
 
 Benchmark results on Qwen3 8B configuration (causal attention, head_dim=128):
 
-**Example Output Format (Transposed Table):**
-```
-========================================================================================================================================================================================================
-Performance Summary (All operators, speedup relative to Naive)
-========================================================================================================================================================================================================
-Method                                         1K (ms)       speed up     2K (ms)       speed up     4K (ms)       speed up     8K (ms)       speed up     
---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
-Naive (PyTorch)                               0.674        -            3.352        -            11.371       -            41.987       -            
-PyTorch SDPA                                  0.560        1.20x        2.041        1.64x        7.992        1.42x        30.859       1.36x        
-Flash Attention + Scores                      0.194        3.47x        1.725        1.94x        2.427        4.69x        8.136        5.16x        
-Flash Attention + Row Sum                     0.129        5.24x        0.335        10.01x       1.154        9.85x        4.252        9.87x        
-Flash Attention + Col Sum (Reverse)           0.156        4.33x        0.493        6.81x        1.699        6.69x        6.273        6.69x        
-Flash Attention + Col Sum (Sequential)        0.159        4.23x        0.497        6.74x        1.720        6.61x        6.303        6.66x        
-Flash Attention + Split QK Sum                0.159        4.22x        0.424        7.91x        1.436        7.92x        5.102        8.23x        
-========================================================================================================================================================================================================
-```
+**Benchmark Results:**
+
+| Method | 1K (ms) | Speedup | 2K (ms) | Speedup | 4K (ms) | Speedup | 8K (ms) | Speedup |
+|--------|---------|---------|---------|---------|---------|---------|---------|---------|
+| Naive (PyTorch) | 0.677 | - | 3.362 | - | 11.325 | - | 40.975 | - |
+| PyTorch SDPA | 0.561 | 1.20× | 2.046 | 1.64× | 7.940 | 1.43× | 30.531 | 1.34× |
+| + Scores | 0.194 | 3.49× | 1.727 | 1.95× | 2.407 | 4.71× | 8.059 | 5.08× |
+| + Row Sum | 0.128 | 5.26× | 0.335 | 10.05× | 1.142 | 9.92× | 4.185 | 9.79× |
+| + Col Sum (Reverse) | 0.155 | 4.37× | 0.493 | 6.82× | 1.690 | 6.70× | 6.233 | 6.57× |
+| + Col Sum (Sequential) | 0.158 | 4.27× | 0.498 | 6.75× | 1.711 | 6.62× | 6.293 | 6.51× |
+| + Cross-Token Softmax Sum | 0.321 | 2.11× | 0.768 | 4.37× | 2.460 | 4.60× | 8.502 | 4.82× |
+| + Cross-Token Softmax Sum (Buffered) | 0.227 | 2.99× | 0.686 | 4.90× | 2.260 | 5.01× | 7.754 | 5.28× |
+| + Cross-Token QK Sum | 0.151 | 4.49× | 0.452 | 7.44× | 1.487 | 7.62× | 5.252 | 7.80× |
+
+*Performance Summary: All operators benchmarked on Qwen3 8B configuration (causal attention, head_dim=128). Speedup is relative to Naive PyTorch implementation. Bold values indicate speedup ≥ 4×.*
 
 ## Architecture
 
